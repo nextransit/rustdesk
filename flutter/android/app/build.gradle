@@ -134,4 +134,15 @@ dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib") { version { strictly("1.9.10") } }
     implementation 'com.caverock:androidsvg-aar:1.4'
     implementation "rustls:rustls-platform-verifier:0.1.1"
+
+    // P0-fix: 闪退 java.lang.ClassNotFoundException: androidx.window.sidecar.SidecarInterface$SidecarCallback
+    // 根因: flutter_plugin_android_lifecycle 2.0.17 (pubspec.yaml 锁定) 传递依赖 androidx.window:window 1.0.0-beta01,
+    // 其 SidecarCompat 静态初始化会调用 SidecarInterface$SidecarCallback. 当 androidx.window 主库在某些 Gradle
+    // 解析路径下被解析为 1.1.0+ (sidecar 模块被移除) 时, 这条调用路径上类不在 dex 里, 导致
+    // android.view.View.dispatchAttachedToWindow 阶段闪退 (常见于 26.106 部署的 Android 8+ 设备)。
+    //
+    // 修法: 显式固定 androidx.window:window 1.0.0 + androidx.window:window-sidecar 1.0.0, 保证 Sidecar 兼容类
+    // 一定被打包. 同时加 R8 keep 规则防御未来 minify 升级时类被剥离。
+    implementation("androidx.window:window:1.0.0")
+    implementation("androidx.window:window-sidecar:1.0.0")
 }

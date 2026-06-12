@@ -5,3 +5,10 @@
 
 # Keep rustls-platform-verifier classes for JNI
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
+
+# P0-fix: 防止 androidx.window sidecar 兼容类在 R8/minify 升级时被剥离 (ClassNotFoundException crash).
+# 详见 app/build.gradle 中对应注释。
+-keep class androidx.window.sidecar.SidecarInterface { *; }
+-keep class androidx.window.sidecar.SidecarInterface$* { *; }
+-keep class androidx.window.layout.adapter.sidecar.** { *; }
+-keep class androidx.window.layout.SidecarCompat$* { *; }
