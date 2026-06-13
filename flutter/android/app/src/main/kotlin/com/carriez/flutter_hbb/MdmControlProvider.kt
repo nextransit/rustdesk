@@ -1,7 +1,10 @@
 package com.carriez.flutter_hbb
 
+import android.app.ActivityManager
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.Cursor
 import android.net.Uri
