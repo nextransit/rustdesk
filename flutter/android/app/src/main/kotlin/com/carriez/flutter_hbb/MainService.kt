@@ -353,7 +353,7 @@ class MainService : Service() {
             MdmControlProvider.ACT_START_NO_PROJECTION -> {
                 Log.d(logTag, "mdm start: ACT_START_NO_PROJECTION")
                 createForegroundNotification()
-                FFI.startService(true)
+                FFI.startService()
                 _isReady = false
             }
         }
