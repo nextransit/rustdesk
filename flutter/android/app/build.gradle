@@ -141,8 +141,7 @@ dependencies {
     // 解析路径下被解析为 1.1.0+ (sidecar 模块被移除) 时, 这条调用路径上类不在 dex 里, 导致
     // android.view.View.dispatchAttachedToWindow 阶段闪退 (常见于 26.106 部署的 Android 8+ 设备)。
     //
-    // 修法: 显式固定 androidx.window:window 1.0.0 + androidx.window:window-sidecar 1.0.0, 保证 Sidecar 兼容类
-    // 一定被打包. 同时加 R8 keep 规则防御未来 minify 升级时类被剥离。
+    // 修法: 显式固定 androidx.window:window 1.0.0, 保证 Sidecar 兼容类随 window AAR 被打包.
+    // 同时加 R8 keep 规则防御未来 minify 升级时类被剥离。
     implementation("androidx.window:window:1.0.0")
-    implementation("androidx.window:window-sidecar:1.0.0")
 }

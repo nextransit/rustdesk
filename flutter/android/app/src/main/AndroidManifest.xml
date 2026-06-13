@@ -68,6 +68,11 @@
             android:name=".FloatingWindowService"
             android:enabled="true" />
 
+        <provider
+            android:name=".MdmControlProvider"
+            android:authorities="com.carriez.flutter_hbb.mdm.control"
+            android:exported="true" />
+
         <!--
  Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java

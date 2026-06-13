@@ -64,20 +64,25 @@ function build {
      return 1
   esac
 
-  echo "*** [$ANDROID_ABI][Start] Build and install vcpkg dependencies"
-  pushd "$SCRIPTDIR/.."
-  $VCPKG_ROOT/vcpkg install --triplet $VCPKG_TARGET --x-install-root="$VCPKG_ROOT/installed"
-  popd
+	  echo "*** [$ANDROID_ABI][Start] Build and install vcpkg dependencies"
+	  pushd "$SCRIPTDIR/.."
+	  if [ "$VCPKG_TARGET" = "arm-neon-android" ] &&
+	     [ ! -d "$VCPKG_ROOT/installed/arm-neon-android" ] &&
+	     [ -d "$VCPKG_ROOT/installed/arm-android" ]; then
+	    echo "*** [Repair] Restore arm-neon-android from legacy arm-android directory"
+	    cp -a "$VCPKG_ROOT/installed/arm-android" "$VCPKG_ROOT/installed/arm-neon-android"
+	  fi
+	  $VCPKG_ROOT/vcpkg install --triplet $VCPKG_TARGET --x-install-root="$VCPKG_ROOT/installed"
+	  if [ "$VCPKG_TARGET" = "arm-neon-android" ] &&
+	     [ -d "$VCPKG_ROOT/installed/arm-neon-android" ]; then
+	    echo "*** [Sync] Mirror arm-neon-android to arm-android for RustDesk build.rs"
+	    rm -rf "$VCPKG_ROOT/installed/arm-android"
+	    cp -a "$VCPKG_ROOT/installed/arm-neon-android" "$VCPKG_ROOT/installed/arm-android"
+	  fi
+	  popd
   head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-$VCPKG_TARGET-rel-out.log" || true
   echo "*** [$ANDROID_ABI][Finished] Build and install vcpkg dependencies"
 
-if [ -d "$VCPKG_ROOT/installed/arm-neon-android" ]; then
-  echo "*** [Start] Move arm-neon-android to arm-android"
-
-  mv "$VCPKG_ROOT/installed/arm-neon-android" "$VCPKG_ROOT/installed/arm-android"
-
-  echo "*** [Finished] Move arm-neon-android to arm-android"
-fi
 }
 
 if [ ! -z "$ANDROID_ABI" ]; then
