@@ -326,7 +326,8 @@ class MainService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d("whichService", "this service: ${Thread.currentThread()}")
         super.onStartCommand(intent, flags, startId)
-        if (intent?.action == ACT_INIT_MEDIA_PROJECTION_AND_SERVICE) {
+        when (intent?.action) {
+            ACT_INIT_MEDIA_PROJECTION_AND_SERVICE -> {
             createForegroundNotification()
 
             if (intent.getBooleanExtra(EXT_INIT_FROM_BOOT, false)) {
@@ -344,6 +345,16 @@ class MainService : Service() {
             } ?: let {
                 Log.d(logTag, "getParcelableExtra intent null, invoke requestMediaProjection")
                 requestMediaProjection()
+            }
+            }
+            // mdm-no-launcher 模式: mdm-agent 拉起 service 进入后台驻留,
+            // 不需要 mediaProjection 也不弹任何 UI, 仅启动 FFI 让 rust 端
+            // 进入 hbbr 监听, 等远控接入
+            MdmControlProvider.ACT_START_NO_PROJECTION -> {
+                Log.d(logTag, "mdm start: ACT_START_NO_PROJECTION")
+                createForegroundNotification()
+                FFI.startService(true)
+                _isReady = false
             }
         }
         return START_NOT_STICKY // don't use sticky (auto restart), the new service (from auto restart) will lose control

@@ -27,6 +27,9 @@ class MdmControlProvider : ContentProvider() {
                 METHOD_SET_SERVER_CONFIG -> setServerConfig(extras)
                 METHOD_SET_SESSION_PASSWORD -> setSessionPassword(extras)
                 METHOD_CLEAR_SESSION_PASSWORD -> clearSessionPassword()
+                METHOD_START_SERVICE -> startService(extras)
+                METHOD_STOP_SERVICE -> stopService()
+                METHOD_SERVICE_STATUS -> serviceStatus()
                 else -> Bundle().apply {
                     putBoolean(KEY_SUCCESS, false)
                     putString(KEY_ERROR, "unknown method: $method")
@@ -98,6 +101,105 @@ class MdmControlProvider : ContentProvider() {
         val cleared = removeRootKeys(readToml(file), setOf("password", "salt"))
         writeToml(file, mergeSection(cleared, "options", linkedMapOf("verification-method" to "")))
         return success(file)
+    }
+
+    /**
+     * 拉起 MainService 后台服务 (无 mediaProjection), 由 mdm-agent 触发.
+     *
+     * 设计: mdm-no-launcher 模式下, RustDesk 自身无桌面图标, 开机不自启.
+     * mdm-agent (system uid) 通过此方法在合适时机拉起后台服务:
+     * - 设备入网后首次配置完成
+     * - 用户登录后需要远控能力
+     * - mdm-agent 拉起此 service 走 foreground service, 不会被 OOM 杀掉
+     *
+     * service 拉起后通过 FFI.startService(true) 进入 rust 端 hbbr 监听,
+     * 等待远控接入请求. MediaProjection 授权延后到首次会话时再触发.
+     */
+    private fun startService(extras: Bundle?): Bundle {
+        val ctx = context ?: return Bundle().apply {
+            putBoolean(KEY_SUCCESS, false); putString(KEY_ERROR, "no context")
+        }
+        val fromBoot = extras?.getBoolean(EXTRA_FROM_BOOT, false) ?: false
+        val intent = Intent(ctx, MainService::class.java).apply {
+            action = ACT_START_NO_PROJECTION
+            putExtra(EXTRA_FROM_BOOT, fromBoot)
+        }
+        return try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent)
+            } else {
+                ctx.startService(intent)
+            }
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, true)
+                putString(KEY_PATH, "MainService start requested")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startService failed", e)
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, false)
+                putString(KEY_ERROR, "startService: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 关闭 MainService (force-stop 应用).
+     *
+     * 警告: 这是进程级 force-stop, 不仅停 service, 也清掉整个应用进程.
+     * mdm-agent 决定何时调用 (如用户登出, 设备重置, 收到远程锁定命令).
+     */
+    private fun stopService(): Bundle {
+        val ctx = context ?: return Bundle().apply {
+            putBoolean(KEY_SUCCESS, false); putString(KEY_ERROR, "no context")
+        }
+        return try {
+            // 用 force-stop 而非 stopService, 避免 rust ffi 残留状态
+            val am = ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            am.killBackgroundProcesses(RUSTDESK_PACKAGE_NAME)
+            ctx.stopService(Intent(ctx, MainService::class.java))
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, true)
+                putString(KEY_PATH, "MainService stop requested")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "stopService failed", e)
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, false)
+                putString(KEY_ERROR, "stopService: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 查询 MainService 当前运行状态.
+     *
+     * 返回: pid (>=0 表示运行) + foreground (是否前台服务)
+     */
+    private fun serviceStatus(): Bundle {
+        val ctx = context ?: return Bundle().apply {
+            putBoolean(KEY_SUCCESS, false); putString(KEY_ERROR, "no context")
+        }
+        return try {
+            val am = ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val isRunning = am.runningAppProcesses?.any {
+                it.processName == RUSTDESK_PACKAGE_NAME
+            } ?: false
+            val isForeground = am.runningAppProcesses?.any {
+                it.processName == RUSTDESK_PACKAGE_NAME && it.importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+            } ?: false
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, true)
+                putBoolean(KEY_STATUS_RUNNING, isRunning)
+                putBoolean(KEY_STATUS_FOREGROUND, isForeground)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "serviceStatus failed", e)
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, false)
+                putString(KEY_ERROR, "serviceStatus: ${e.message}")
+            }
+        }
     }
 
     private fun isAuthorizedCaller(): Boolean {
@@ -255,18 +357,30 @@ class MdmControlProvider : ContentProvider() {
         private const val AGENT_PACKAGE = "com.decard.mdm.agent"
         private const val RUSTDESK_TOML = "RustDesk.toml"
         private const val RUSTDESK2_TOML = "RustDesk2.toml"
+        private const val RUSTDESK_PACKAGE_NAME = "com.carriez.flutter_hbb"
 
         private const val METHOD_SET_SERVER_CONFIG = "set_server_config"
         private const val METHOD_SET_SESSION_PASSWORD = "set_session_password"
         private const val METHOD_CLEAR_SESSION_PASSWORD = "clear_session_password"
+        private const val METHOD_START_SERVICE = "start_service"
+        private const val METHOD_STOP_SERVICE = "stop_service"
+        private const val METHOD_SERVICE_STATUS = "service_status"
 
         private const val EXTRA_HBBS = "hbbs"
         private const val EXTRA_HBBR = "hbbr"
         private const val EXTRA_KEY = "key"
         private const val EXTRA_PASSWORD = "password"
+        private const val EXTRA_FROM_BOOT = "from_boot"
 
         private const val KEY_SUCCESS = "success"
         private const val KEY_ERROR = "error"
         private const val KEY_PATH = "path"
+        private const val KEY_STATUS_RUNNING = "running"
+        private const val KEY_STATUS_FOREGROUND = "foreground"
+
+        // mdm-agent 拉起 service 的 action (无 mediaProjection, 用于纯后台驻留)
+        // 与 ACT_INIT_MEDIA_PROJECTION_AND_SERVICE 区别: 不弹投屏确认, 不需要 mediaProjection intent
+        // MainService.onStartCommand 需要识别并走纯 FFI 启动路径
+        const val ACT_START_NO_PROJECTION = "com.carriez.flutter_hbb.START_NO_PROJECTION"
     }
 }
