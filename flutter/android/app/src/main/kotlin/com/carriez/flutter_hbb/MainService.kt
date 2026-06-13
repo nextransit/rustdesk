@@ -331,7 +331,7 @@ class MainService : Service() {
             createForegroundNotification()
 
             if (intent.getBooleanExtra(EXT_INIT_FROM_BOOT, false)) {
-                FFI.startService()
+                FFI.startService(appFlutterDir())
             }
             Log.d(logTag, "service starting: ${startId}:${Thread.currentThread()}")
             val mediaProjectionManager =
@@ -353,12 +353,14 @@ class MainService : Service() {
             MdmControlProvider.ACT_START_NO_PROJECTION -> {
                 Log.d(logTag, "mdm start: ACT_START_NO_PROJECTION")
                 createForegroundNotification()
-                FFI.startService()
+                FFI.startService(appFlutterDir())
                 _isReady = false
             }
         }
         return START_NOT_STICKY // don't use sticky (auto restart), the new service (from auto restart) will lose control
     }
+
+    private fun appFlutterDir(): String = "${applicationInfo.dataDir}/app_flutter"
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)

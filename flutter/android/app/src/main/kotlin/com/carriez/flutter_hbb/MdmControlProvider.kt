@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
 import android.util.Log
+import ffi.FFI
 import java.io.File
 import java.security.SecureRandom
 
@@ -33,6 +34,7 @@ class MdmControlProvider : ContentProvider() {
                 METHOD_START_SERVICE -> startService(extras)
                 METHOD_STOP_SERVICE -> stopService()
                 METHOD_SERVICE_STATUS -> serviceStatus()
+                METHOD_GET_IDENTITY -> getIdentity()
                 else -> Bundle().apply {
                     putBoolean(KEY_SUCCESS, false)
                     putString(KEY_ERROR, "unknown method: $method")
@@ -205,6 +207,25 @@ class MdmControlProvider : ContentProvider() {
         }
     }
 
+    private fun getIdentity(): Bundle {
+        val appDir = configDir()
+        val runtimeId = runCatching {
+            FFI.getMyId(appDir.absolutePath)
+        }.getOrElse {
+            Log.w(TAG, "getIdentity runtime id unavailable: ${it.message}")
+            ""
+        }.trim()
+
+        val rustDeskId = normalizeRustDeskId(runtimeId)
+            ?: readRustDeskIdFromConfig()
+
+        return Bundle().apply {
+            putBoolean(KEY_SUCCESS, true)
+            putString(KEY_RUSTDESK_ID, rustDeskId.orEmpty())
+            putString(KEY_PATH, appDir.absolutePath)
+        }
+    }
+
     private fun isAuthorizedCaller(): Boolean {
         val callingUid = Binder.getCallingUid()
         if (callingUid == android.os.Process.SYSTEM_UID || callingUid == android.os.Process.ROOT_UID) {
@@ -355,6 +376,30 @@ class MdmControlProvider : ContentProvider() {
         }
     }
 
+    private fun readRustDeskIdFromConfig(): String? {
+        val candidates = listOf(
+            File(configDir(), RUSTDESK_TOML),
+            File(configDir(), RUSTDESK2_TOML)
+        )
+        for (file in candidates) {
+            val id = parseRustDeskId(readToml(file).joinToString("\n"))
+            if (!id.isNullOrBlank()) {
+                return id
+            }
+        }
+        return null
+    }
+
+    private fun parseRustDeskId(content: String): String? {
+        val idRegex = Regex("""(?m)^\s*id\s*=\s*["']?([0-9][0-9\s-]{5,})["']?""")
+        return idRegex.find(content)?.groupValues?.getOrNull(1)?.let { normalizeRustDeskId(it) }
+    }
+
+    private fun normalizeRustDeskId(value: String?): String? {
+        val digits = value.orEmpty().filter { it.isDigit() }
+        return digits.takeIf { it.length >= 6 }
+    }
+
     companion object {
         private const val TAG = "MdmControlProvider"
         private const val AGENT_PACKAGE = "com.decard.mdm.agent"
@@ -368,6 +413,7 @@ class MdmControlProvider : ContentProvider() {
         private const val METHOD_START_SERVICE = "start_service"
         private const val METHOD_STOP_SERVICE = "stop_service"
         private const val METHOD_SERVICE_STATUS = "service_status"
+        private const val METHOD_GET_IDENTITY = "get_identity"
 
         private const val EXTRA_HBBS = "hbbs"
         private const val EXTRA_HBBR = "hbbr"
@@ -380,6 +426,7 @@ class MdmControlProvider : ContentProvider() {
         private const val KEY_PATH = "path"
         private const val KEY_STATUS_RUNNING = "running"
         private const val KEY_STATUS_FOREGROUND = "foreground"
+        private const val KEY_RUSTDESK_ID = "rustdesk_id"
 
         // mdm-agent 拉起 service 的 action (无 mediaProjection, 用于纯后台驻留)
         // 与 ACT_INIT_MEDIA_PROJECTION_AND_SERVICE 区别: 不弹投屏确认, 不需要 mediaProjection intent

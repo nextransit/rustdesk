@@ -3069,11 +3069,39 @@ pub mod server_side {
     }
 
     #[no_mangle]
-    pub unsafe extern "system" fn Java_ffi_FFI_startService(_env: JNIEnv, _class: JClass) {
+    pub unsafe extern "system" fn Java_ffi_FFI_startService(
+        env: JNIEnv,
+        _class: JClass,
+        app_dir: JString,
+    ) {
         log::debug!("startService from jvm");
+        let mut env = env;
+        if let Ok(app_dir) = env.get_string(&app_dir) {
+            let app_dir: String = app_dir.into();
+            if !app_dir.is_empty() {
+                *config::APP_DIR.write().unwrap() = app_dir;
+            }
+        }
         config::Config::set_option("stop-service".into(), "".into());
         crate::rendezvous_mediator::reset_needs_deploy_notification();
         crate::rendezvous_mediator::RendezvousMediator::restart();
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_getMyId(
+        env: JNIEnv,
+        _class: JClass,
+        app_dir: JString,
+    ) -> jstring {
+        let mut env = env;
+        if let Ok(app_dir) = env.get_string(&app_dir) {
+            let app_dir: String = app_dir.into();
+            if !app_dir.is_empty() {
+                *config::APP_DIR.write().unwrap() = app_dir;
+            }
+        }
+        let res = config::Config::get_id();
+        return env.new_string(res).unwrap_or_default().into_raw();
     }
 
     #[no_mangle]
