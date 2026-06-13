@@ -128,7 +128,15 @@ class MainService : Service() {
                     }
                     if (authorized) {
                         if (!isFileTransfer && !isStart) {
-                            startCapture()
+                            // mdm-no-launcher: 远控连入时如未授权 mediaProjection, 主动请求.
+                            // ACT_START_NO_PROJECTION 路径不强制投屏, 首次远控必须主动触发,
+                            // 否则 startCapture 静默失败。
+                            if (mediaProjection == null) {
+                                Log.d(logTag, "add_connection: mediaProjection null, requesting")
+                                requestMediaProjection()
+                            } else {
+                                startCapture()
+                            }
                         }
                         onClientAuthorizedNotification(id, type, username, peerId)
                     } else {
@@ -242,7 +250,10 @@ class MainService : Service() {
 
         // keep the config dir same with flutter
         val prefs = applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, FlutterActivity.MODE_PRIVATE)
-        val configPath = prefs.getString(KEY_APP_DIR_CONFIG_PATH, "") ?: ""
+        val configPath = prefs.getString(KEY_APP_DIR_CONFIG_PATH, "")?.takeIf { it.isNotBlank() }
+            ?: appFlutterDir().also {
+                prefs.edit().putString(KEY_APP_DIR_CONFIG_PATH, it).apply()
+            }
         FFI.startServer(configPath, "")
 
         createForegroundNotification()

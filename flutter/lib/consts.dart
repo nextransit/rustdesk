@@ -203,6 +203,10 @@ const String kOptionToggleShowMyCursor = "show-my-cursor";
 
 const String kOptionDisableFloatingWindow = "disable-floating-window";
 
+// mdm-no-launcher: 主控端点连接时自动接受「开始媒体共享」确认弹窗 (跳过交互),
+// 用于 mdm-agent 自动化测试, 关闭后需通过设置页关闭。
+const String kOptionAutoAcceptStart = "auto-accept-start";
+
 const String kOptionKeepScreenOn = "keep-screen-on";
 
 const String kOptionKeepAwakeDuringIncomingSessions = "keep-awake-during-incoming-sessions";

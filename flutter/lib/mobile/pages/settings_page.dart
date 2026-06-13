@@ -85,6 +85,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _autoRecordIncomingSession = false;
   var _autoRecordOutgoingSession = false;
   var _allowAutoDisconnect = false;
+  // mdm-no-launcher: 主控端点连接时是否跳过"开始媒体共享" Alert.
+  // 自动化测试场景置 Y, 真实用户保持 N (默认值).
+  var _autoAcceptStart = false;
   var _localIP = "";
   var _directAccessPort = "";
   var _fingerprint = "";
@@ -129,6 +132,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
     _autoDisconnectTimeout =
         bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
+    _autoAcceptStart = mainGetBoolOptionSync(kOptionAutoAcceptStart);
     _hideServer =
         bind.mainGetBuildinOption(key: kOptionHideServerSetting) == 'Y';
     _hideProxy = bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
@@ -520,6 +524,20 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                     key: kOptionAllowAutoDisconnect, value: value);
                 setState(() {});
               },
+      ),
+      // mdm-no-launcher: 关闭"要求 mediaProjection 授权" (主控端连接被控设备时跳过 Alert),
+      // 让自动化测试一次完成远控接入。该选项仅跳过应用层 Alert, 系统投屏授权仍由 Android 强制执行。
+      SettingsTile.switchTile(
+        title: Row(children: [
+          Expanded(child: Text(translate('Skip start media confirmation'))),
+        ]),
+        initialValue: _autoAcceptStart,
+        onToggle: (v) async {
+          _autoAcceptStart = v;
+          await bind.mainSetLocalOption(
+              key: kOptionAutoAcceptStart, value: bool2option('', v));
+          setState(() {});
+        },
       )
     ];
     if (_hasIgnoreBattery) {

@@ -421,27 +421,34 @@ class ServerModel with ChangeNotifier {
       if (!await AndroidPermissionManager.check(kManageExternalStorage)) {
         await AndroidPermissionManager.request(kManageExternalStorage);
       }
-      final res = await parent.target?.dialogManager
-          .show<bool>((setState, close, context) {
-        submit() => close(true);
-        return CustomAlertDialog(
-          title: Row(children: [
-            const Icon(Icons.warning_amber_sharp,
-                color: Colors.redAccent, size: 28),
-            const SizedBox(width: 10),
-            Text(translate("Warning")),
-          ]),
-          content: Text(translate("android_service_will_start_tip")),
-          actions: [
-            dialogButton("Cancel", onPressed: close, isOutline: true),
-            dialogButton("OK", onPressed: submit),
-          ],
-          onSubmit: submit,
-          onCancel: close,
-        );
-      });
-      if (res == true) {
+      // mdm-no-launcher: 主控端点连接时跳过 "android_service_will_start_tip" 弹窗,
+      // 自动化测试场景下不应阻断. 通过 isAutoAcceptStart 开关控制.
+      if (kOptionAutoAcceptStart != '' &&
+          bind.mainGetLocalOption(key: kOptionAutoAcceptStart) == 'Y') {
         startService();
+      } else {
+        final res = await parent.target?.dialogManager
+            .show<bool>((setState, close, context) {
+          submit() => close(true);
+          return CustomAlertDialog(
+            title: Row(children: [
+              const Icon(Icons.warning_amber_sharp,
+                  color: Colors.redAccent, size: 28),
+              const SizedBox(width: 10),
+              Text(translate("Warning")),
+            ]),
+            content: Text(translate("android_service_will_start_tip")),
+            actions: [
+              dialogButton("Cancel", onPressed: close, isOutline: true),
+              dialogButton("OK", onPressed: submit),
+            ],
+            onSubmit: submit,
+            onCancel: close,
+          );
+        });
+        if (res == true) {
+          startService();
+        }
       }
     }
   }

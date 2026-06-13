@@ -125,6 +125,10 @@ class MdmControlProvider : ContentProvider() {
             putBoolean(KEY_SUCCESS, false); putString(KEY_ERROR, "no context")
         }
         val fromBoot = extras?.getBoolean(EXTRA_FROM_BOOT, false) ?: false
+        ctx.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_APP_DIR_CONFIG_PATH, configDir().absolutePath)
+            .apply()
         val intent = Intent(ctx, MainService::class.java).apply {
             action = ACT_START_NO_PROJECTION
             putExtra(EXTRA_FROM_BOOT, fromBoot)
@@ -187,16 +191,15 @@ class MdmControlProvider : ContentProvider() {
         }
         return try {
             val am = ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-            val isRunning = am.runningAppProcesses?.any {
-                it.processName == RUSTDESK_PACKAGE_NAME
-            } ?: false
-            val isForeground = am.runningAppProcesses?.any {
-                it.processName == RUSTDESK_PACKAGE_NAME && it.importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
-            } ?: false
+            @Suppress("DEPRECATION")
+            val mainService = am.getRunningServices(Int.MAX_VALUE).firstOrNull {
+                it.service.packageName == RUSTDESK_PACKAGE_NAME &&
+                    it.service.className == MainService::class.java.name
+            }
             Bundle().apply {
                 putBoolean(KEY_SUCCESS, true)
-                putBoolean(KEY_STATUS_RUNNING, isRunning)
-                putBoolean(KEY_STATUS_FOREGROUND, isForeground)
+                putBoolean(KEY_STATUS_RUNNING, mainService != null)
+                putBoolean(KEY_STATUS_FOREGROUND, mainService?.foreground == true)
             }
         } catch (e: Exception) {
             Log.e(TAG, "serviceStatus failed", e)
