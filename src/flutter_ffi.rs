@@ -3105,6 +3105,47 @@ pub mod server_side {
     }
 
     #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_setPermanentPassword(
+        env: JNIEnv,
+        _class: JClass,
+        app_dir: JString,
+        password: JString,
+    ) -> jboolean {
+        let mut env = env;
+        if let Ok(app_dir) = env.get_string(&app_dir) {
+            let app_dir: String = app_dir.into();
+            if !app_dir.is_empty() {
+                *config::APP_DIR.write().unwrap() = app_dir;
+            }
+        }
+        let Ok(password) = env.get_string(&password) else {
+            return jboolean::from(false);
+        };
+        config::Config::set_option(
+            "verification-method".to_owned(),
+            "use-permanent-password".to_owned(),
+        );
+        jboolean::from(super::main_set_permanent_password_with_result(password.into()))
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_clearPermanentPassword(
+        env: JNIEnv,
+        _class: JClass,
+        app_dir: JString,
+    ) -> jboolean {
+        let mut env = env;
+        if let Ok(app_dir) = env.get_string(&app_dir) {
+            let app_dir: String = app_dir.into();
+            if !app_dir.is_empty() {
+                *config::APP_DIR.write().unwrap() = app_dir;
+            }
+        }
+        config::Config::set_option("verification-method".to_owned(), "".to_owned());
+        jboolean::from(super::main_set_permanent_password_with_result("".to_owned()))
+    }
+
+    #[no_mangle]
     pub unsafe extern "system" fn Java_ffi_FFI_translateLocale(
         env: JNIEnv,
         _class: JClass,

@@ -67,22 +67,16 @@ class MainService : Service() {
     fun rustPointerInput(kind: Int, mask: Int, x: Int, y: Int) {
         // turn on screen with LEFT_DOWN when screen off
         if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
-            if (wakeLock.isHeld) {
-                Log.d(logTag, "Turn on Screen, WakeLock release")
-                wakeLock.release()
+            ensureScreenInteractive("pointer_input")
+        }
+        when (kind) {
+            0 -> { // touch
+                InputService.ctx?.onTouchInput(mask, x, y)
             }
-            Log.d(logTag,"Turn on Screen")
-            wakeLock.acquire(5000)
-        } else {
-            when (kind) {
-                0 -> { // touch
-                    InputService.ctx?.onTouchInput(mask, x, y)
-                }
-                1 -> { // mouse
-                    InputService.ctx?.onMouseInput(mask, x, y)
-                }
-                else -> {
-                }
+            1 -> { // mouse
+                InputService.ctx?.onMouseInput(mask, x, y)
+            }
+            else -> {
             }
         }
     }
@@ -131,6 +125,7 @@ class MainService : Service() {
                             // mdm-no-launcher: 远控连入时如未授权 mediaProjection, 主动请求.
                             // ACT_START_NO_PROJECTION 路径不强制投屏, 首次远控必须主动触发,
                             // 否则 startCapture 静默失败。
+                            keepScreenInteractive("add_connection")
                             if (mediaProjection == null) {
                                 Log.d(logTag, "add_connection: mediaProjection null, requesting")
                                 requestMediaProjection()
@@ -202,6 +197,36 @@ class MainService : Service() {
     private val powerManager: PowerManager by lazy { applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val wakeLock: PowerManager.WakeLock by lazy { powerManager.newWakeLock(PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "rustdesk:wakelock")}
 
+    private fun ensureScreenInteractive(reason: String) {
+        if (powerManager.isInteractive && wakeLock.isHeld) {
+            return
+        }
+        if (wakeLock.isHeld) {
+            Log.d(logTag, "Wake screen for $reason, WakeLock release")
+            wakeLock.release()
+        }
+        Log.d(logTag, "Wake screen for $reason")
+        wakeLock.acquire(5000)
+    }
+
+    private fun keepScreenInteractive(reason: String) {
+        if (wakeLock.isHeld && powerManager.isInteractive) {
+            return
+        }
+        if (wakeLock.isHeld) {
+            wakeLock.release()
+        }
+        Log.d(logTag, "Keep screen awake for $reason")
+        wakeLock.acquire()
+    }
+
+    private fun releaseScreenWakeLock(reason: String) {
+        if (wakeLock.isHeld) {
+            Log.d(logTag, "Release screen wake lock for $reason")
+            wakeLock.release()
+        }
+    }
+
     companion object {
         private var _isReady = false // media permission ready status
         private var _isStart = false // screen capture start status
@@ -261,6 +286,7 @@ class MainService : Service() {
 
     override fun onDestroy() {
         checkMediaPermission()
+        releaseScreenWakeLock("service_destroy")
         stopService(Intent(this, FloatingWindowService::class.java))
         super.onDestroy()
     }
@@ -435,6 +461,7 @@ class MainService : Service() {
             Log.w(logTag, "startCapture fail,mediaProjection is null")
             return false
         }
+        keepScreenInteractive("start_capture")
         
         updateScreenInfo(resources.configuration.orientation)
         Log.d(logTag, "Start Capture")
@@ -496,6 +523,7 @@ class MainService : Service() {
         // release audio
         _isAudioStart = false
         audioRecordHandle.tryReleaseAudio()
+        releaseScreenWakeLock("stop_capture")
     }
 
     fun destroy() {

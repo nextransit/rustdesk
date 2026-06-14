@@ -13,7 +13,6 @@ import android.os.Bundle
 import android.util.Log
 import ffi.FFI
 import java.io.File
-import java.security.SecureRandom
 
 class MdmControlProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
@@ -90,21 +89,16 @@ class MdmControlProvider : ContentProvider() {
         val password = extras?.getString(EXTRA_PASSWORD)?.trim().orEmpty()
         require(password.isNotBlank()) { "password is required" }
 
-        val config = linkedMapOf(
-            "password" to password,
-            "salt" to randomSalt()
-        )
-        val options = linkedMapOf("verification-method" to "use-permanent-password")
         val file = File(configDir(), RUSTDESK_TOML)
-        val mergedConfig = mergeRootKeys(readToml(file), config)
-        writeToml(file, mergeSection(mergedConfig, "options", options))
+        val ok = FFI.setPermanentPassword(configDir().absolutePath, password)
+        require(ok) { "set permanent password failed" }
         return success(file)
     }
 
     private fun clearSessionPassword(): Bundle {
         val file = File(configDir(), RUSTDESK_TOML)
-        val cleared = removeRootKeys(readToml(file), setOf("password", "salt"))
-        writeToml(file, mergeSection(cleared, "options", linkedMapOf("verification-method" to "")))
+        val ok = FFI.clearPermanentPassword(configDir().absolutePath)
+        require(ok) { "clear permanent password failed" }
         return success(file)
     }
 
@@ -257,45 +251,6 @@ class MdmControlProvider : ContentProvider() {
         file.writeText(lines.joinToString("\n").trimEnd() + "\n")
     }
 
-    private fun mergeRootKeys(lines: List<String>, values: LinkedHashMap<String, String>): List<String> {
-        val keys = values.keys
-        val output = mutableListOf<String>()
-        var inserted = false
-
-        for (line in lines) {
-            val trimmed = line.trim()
-            if (!inserted && trimmed.startsWith("[") && trimmed.endsWith("]")) {
-                appendTomlPairs(output, values)
-                inserted = true
-            }
-            if (!trimmed.startsWith("[") && keys.any { isTomlKeyLine(trimmed, it) }) {
-                continue
-            }
-            output += line
-        }
-
-        if (!inserted) {
-            appendTomlPairs(output, values)
-        }
-        return output
-    }
-
-    private fun removeRootKeys(lines: List<String>, keys: Set<String>): List<String> {
-        val output = mutableListOf<String>()
-        var inRoot = true
-        for (line in lines) {
-            val trimmed = line.trim()
-            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-                inRoot = false
-            }
-            if (inRoot && keys.any { isTomlKeyLine(trimmed, it) }) {
-                continue
-            }
-            output += line
-        }
-        return output
-    }
-
     private fun mergeSection(
         lines: List<String>,
         section: String,
@@ -362,14 +317,6 @@ class MdmControlProvider : ContentProvider() {
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
             .replace("\n", "\\n") + "\""
-    }
-
-    private fun randomSalt(): String {
-        val chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        val random = SecureRandom()
-        return (1..32)
-            .map { chars[random.nextInt(chars.length)] }
-            .joinToString("")
     }
 
     private fun success(file: File): Bundle {
