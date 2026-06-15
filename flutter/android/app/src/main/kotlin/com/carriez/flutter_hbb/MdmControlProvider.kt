@@ -75,14 +75,35 @@ class MdmControlProvider : ContentProvider() {
         require(hbbs.isNotBlank()) { "hbbs is required" }
         require(hbbr.isNotBlank()) { "hbbr is required" }
 
-        val options = linkedMapOf(
-            "custom-rendezvous-server" to hbbs,
-            "relay-server" to hbbr,
-            "key" to key
-        )
-        val file = File(configDir(), RUSTDESK2_TOML)
-        writeToml(file, mergeSection(readToml(file), "options", options))
-        return success(file)
+        // mdm-no-launcher: 走 FFI.startServer(custom_client_config) in-memory 注入,
+        // 绕过 RustDesk2.toml 文件写入. 原因: rustdesk 进程以 untrusted_app (u0_a51)
+        // 跑, SELinux 拒写 system_data_file label 的 RustDesk2.toml (avc denied write).
+        // custom_client_config 是 INI 字符串, rust 端 read_custom_client 解析.
+        val cfg = buildCustomClientConfig(hbbs, hbbr, key)
+        val ok = FFI.startServer(configDir().absolutePath, cfg)
+        if (!ok) {
+            throw IllegalStateException("FFI.startServer(in-memory) failed for $configDir")
+        }
+        return success(File(configDir(), RUSTDESK2_TOML))
+    }
+
+    /**
+     * 拼装 custom_client_config INI 字符串. 格式参考 hbbs 自定义客户端 config.
+     *
+     *   [options]
+     *   custom-rendezvous-server = hbbs:21116
+     *   relay-server = hbbr:21117
+     *   key = <base64-key>
+     */
+    private fun buildCustomClientConfig(hbbs: String, hbbr: String, key: String): String {
+        val sb = StringBuilder()
+        sb.append("[options]\n")
+        sb.append("custom-rendezvous-server = ").append(hbbs).append('\n')
+        sb.append("relay-server = ").append(hbbr).append('\n')
+        if (key.isNotBlank()) {
+            sb.append("key = ").append(key).append('\n')
+        }
+        return sb.toString()
     }
 
     private fun setSessionPassword(extras: Bundle?): Bundle {
