@@ -1,5 +1,44 @@
 # RustDesk Guide
 
+## MDM Companion Build Rules
+
+This RustDesk checkout is used as the MDM-controlled Android companion. Do not build it locally on macOS.
+
+Forbidden local commands in this subtree:
+
+* `flutter build apk`
+* `cargo build` / `cargo check` / `cargo test` / `cargo ndk`
+* Gradle / Android local builds
+* `flutter/build_android_deps.sh`
+
+Use the parent MDM repository remote build script from the repository root:
+
+```bash
+./scripts/build-rustdesk-companion-remote.sh \
+  --remote-dir /media/ben/work_2021/deploy/rustdesk-companion \
+  --abis "arm64-v8a armeabi-v7a" \
+  --output build-output/rustdesk/rustdesk-companion.apk
+```
+
+Probe the remote toolchain first when needed:
+
+```bash
+./scripts/build-rustdesk-companion-remote.sh \
+  --probe-only \
+  --remote-dir /media/ben/work_2021/deploy/rustdesk-companion \
+  --abis "arm64-v8a armeabi-v7a" \
+  --output build-output/rustdesk/rustdesk-companion.apk
+```
+
+Output APK: `build-output/rustdesk/rustdesk-companion.apk`.
+
+Production companion constraints:
+
+* No launcher entry.
+* No autostart.
+* No built-in permanent remote-control password.
+* ID server, relay, key, and one-time session password must come from MDM backend and be written by MDM Agent.
+
 ## Project Layout
 
 ### Directory Structure

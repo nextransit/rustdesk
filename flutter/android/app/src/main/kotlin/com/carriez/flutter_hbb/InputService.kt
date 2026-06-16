@@ -62,12 +62,6 @@ const val LONG_TAP_DELAY = 200L
 
 class InputService : AccessibilityService() {
 
-    companion object {
-        var ctx: InputService? = null
-        val isOpen: Boolean
-            get() = ctx != null
-    }
-
     private val logTag = "input service"
     private var leftIsDown = false
     private var touchPath = Path()
@@ -83,6 +77,7 @@ class InputService : AccessibilityService() {
     private val wheelActionsQueue = LinkedList<GestureDescription>()
     private var isWheelActionsPolling = false
     private var isWaitingLongPress = false
+    private var lastMediaProjectionAutoApproveAt = 0L
 
     private var fakeEditTextForTextStateCalculation: EditText? = null
 
@@ -96,11 +91,11 @@ class InputService : AccessibilityService() {
         val x = max(0, _x)
         val y = max(0, _y)
 
+        val oldX = mouseX
+        val oldY = mouseY
+        mouseX = x * SCREEN_INFO.scale
+        mouseY = y * SCREEN_INFO.scale
         if (mask == 0 || mask == LEFT_MOVE) {
-            val oldX = mouseX
-            val oldY = mouseY
-            mouseX = x * SCREEN_INFO.scale
-            mouseY = y * SCREEN_INFO.scale
             if (isWaitingLongPress) {
                 val delta = abs(oldX - mouseX) + abs(oldY - mouseY)
                 Log.d(logTag,"delta:$delta")
@@ -275,6 +270,92 @@ class InputService : AccessibilityService() {
     @RequiresApi(Build.VERSION_CODES.N)
     private fun longPress(x: Int, y: Int) {
         performClick(x, y, longPressDuration)
+    }
+
+    private fun maybeAutoApproveMediaProjectionPrompt(event: AccessibilityEvent) {
+        val packageName = event.packageName?.toString().orEmpty()
+        val className = event.className?.toString().orEmpty()
+        if (packageName != "com.android.systemui" && !className.contains("MediaProjection", ignoreCase = true)) {
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastMediaProjectionAutoApproveAt < 500L) {
+            return
+        }
+
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        rootInActiveWindow?.let { roots += it }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            windows.forEach { window ->
+                window.root?.let { roots += it }
+            }
+        }
+
+        val promptRoot = roots.firstOrNull { root ->
+            className.contains("MediaProjection", ignoreCase = true) || containsMediaProjectionPrompt(root)
+        } ?: return
+
+        val target = findMediaProjectionPositiveButton(promptRoot) ?: return
+        val clicked = clickNodeOrClickableParent(target)
+        lastMediaProjectionAutoApproveAt = now
+        Log.i(logTag, "MediaProjection prompt auto-approved by accessibility: clicked=$clicked text=${target.text}")
+    }
+
+    private fun containsMediaProjectionPrompt(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) {
+            return false
+        }
+        val value = listOfNotNull(
+            node.text?.toString(),
+            node.contentDescription?.toString(),
+            node.className?.toString(),
+            node.viewIdResourceName
+        ).joinToString(" ").lowercase(Locale.ROOT)
+        if (MEDIA_PROJECTION_PROMPT_WORDS.any { value.contains(it) }) {
+            return true
+        }
+        for (i in 0 until node.childCount) {
+            if (containsMediaProjectionPrompt(node.getChild(i))) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun findMediaProjectionPositiveButton(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (node == null) {
+            return null
+        }
+        val value = listOfNotNull(
+            node.text?.toString(),
+            node.contentDescription?.toString(),
+            node.viewIdResourceName
+        ).joinToString(" ").trim()
+        val lower = value.lowercase(Locale.ROOT)
+        val isNegative = MEDIA_PROJECTION_NEGATIVE_WORDS.any { lower.contains(it) }
+        val isPositive = MEDIA_PROJECTION_POSITIVE_WORDS.any { lower.contains(it) }
+        if (node.isEnabled && isPositive && !isNegative) {
+            return node
+        }
+        for (i in 0 until node.childCount) {
+            findMediaProjectionPositiveButton(node.getChild(i))?.let { return it }
+        }
+        if (node.isEnabled && !isNegative && node.isClickable && node.className?.toString()?.contains("Button", ignoreCase = true) == true) {
+            return node
+        }
+        return null
+    }
+
+    private fun clickNodeOrClickableParent(node: AccessibilityNodeInfo): Boolean {
+        var current: AccessibilityNodeInfo? = node
+        while (current != null) {
+            if (current.isEnabled && current.isClickable) {
+                return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            }
+            current = current.parent
+        }
+        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
     }
 
     private fun startGesture(x: Int, y: Int) {
@@ -711,6 +792,7 @@ class InputService : AccessibilityService() {
 
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        maybeAutoApproveMediaProjectionPrompt(event)
     }
 
     override fun onServiceConnected() {
@@ -722,6 +804,11 @@ class InputService : AccessibilityService() {
         } else {
             info.flags = FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
+        info.eventTypes = AccessibilityEvent.TYPE_WINDOWS_CHANGED or
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+        info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+        info.notificationTimeout = 0
         setServiceInfo(info)
         fakeEditTextForTextStateCalculation = EditText(this)
         // Size here doesn't matter, we won't show this view.
@@ -738,4 +825,39 @@ class InputService : AccessibilityService() {
     }
 
     override fun onInterrupt() {}
+
+    companion object {
+        private val MEDIA_PROJECTION_PROMPT_WORDS = listOf(
+            "mediaprojection",
+            "media projection",
+            "screen capture",
+            "screen recording",
+            "recording or casting",
+            "录制",
+            "投射",
+            "投屏",
+            "共享屏幕",
+            "屏幕"
+        )
+        private val MEDIA_PROJECTION_POSITIVE_WORDS = listOf(
+            "立即开始",
+            "开始",
+            "允许",
+            "同意",
+            "确定",
+            "start now",
+            "start",
+            "allow",
+            "ok"
+        )
+        private val MEDIA_PROJECTION_NEGATIVE_WORDS = listOf(
+            "取消",
+            "拒绝",
+            "deny",
+            "cancel"
+        )
+        var ctx: InputService? = null
+        val isOpen: Boolean
+            get() = ctx != null
+    }
 }

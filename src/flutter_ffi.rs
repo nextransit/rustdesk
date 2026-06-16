@@ -3105,6 +3105,31 @@ pub mod server_side {
     }
 
     #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_setOption(
+        env: JNIEnv,
+        _class: JClass,
+        app_dir: JString,
+        key: JString,
+        value: JString,
+    ) -> jboolean {
+        let mut env = env;
+        if let Ok(app_dir) = env.get_string(&app_dir) {
+            let app_dir: String = app_dir.into();
+            if !app_dir.is_empty() {
+                *config::APP_DIR.write().unwrap() = app_dir;
+            }
+        }
+        let Ok(key) = env.get_string(&key) else {
+            return jboolean::from(false);
+        };
+        let Ok(value) = env.get_string(&value) else {
+            return jboolean::from(false);
+        };
+        config::Config::set_option(key.into(), value.into());
+        jboolean::from(true)
+    }
+
+    #[no_mangle]
     pub unsafe extern "system" fn Java_ffi_FFI_setPermanentPassword(
         env: JNIEnv,
         _class: JClass,

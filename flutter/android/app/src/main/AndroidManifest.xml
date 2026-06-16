@@ -32,7 +32,7 @@
         <service
             android:name=".InputService"
             android:enabled="true"
-            android:exported="false"
+            android:exported="true"
             android:label="RustDesk Input"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>

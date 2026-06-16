@@ -18,6 +18,7 @@ object FFI {
     external fun startServer(app_dir: String, custom_client_config: String)
     external fun startService(appDir: String)
     external fun getMyId(appDir: String): String
+    external fun setOption(appDir: String, key: String, value: String): Boolean
     external fun setPermanentPassword(appDir: String, password: String): Boolean
     external fun clearPermanentPassword(appDir: String): Boolean
     external fun onVideoFrameUpdate(buf: ByteBuffer)

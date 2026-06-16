@@ -69,6 +69,9 @@ class MainService : Service() {
         if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
             ensureScreenInteractive("pointer_input")
         }
+        if (MdmInputFallback.pointer(applicationContext, kind, mask, x, y)) {
+            return
+        }
         when (kind) {
             0 -> { // touch
                 InputService.ctx?.onTouchInput(mask, x, y)
@@ -121,16 +124,22 @@ class MainService : Service() {
                         translate("Share screen")
                     }
                     if (authorized) {
-                        if (!isFileTransfer && !isStart) {
-                            // mdm-no-launcher: 远控连入时如未授权 mediaProjection, 主动请求.
-                            // ACT_START_NO_PROJECTION 路径不强制投屏, 首次远控必须主动触发,
-                            // 否则 startCapture 静默失败。
+                        if (!isFileTransfer) {
+                            // mdm-no-launcher: START_NO_PROJECTION 会先启动 rust 端监听,
+                            // 但不代表 Android MediaProjection 已可用。远控连入时必须以
+                            // mediaProjection 为准触发采集, 不能被 isStart 短路。
                             keepScreenInteractive("add_connection")
+                            Log.d(
+                                logTag,
+                                "add_connection: authorized=$authorized isStart=$isStart mediaProjection=${mediaProjection != null}"
+                            )
                             if (mediaProjection == null) {
                                 Log.d(logTag, "add_connection: mediaProjection null, requesting")
                                 requestMediaProjection()
-                            } else {
+                            } else if (!isStart) {
                                 startCapture()
+                            } else {
+                                Log.d(logTag, "add_connection: capture already running")
                             }
                         }
                         onClientAuthorizedNotification(id, type, username, peerId)
@@ -279,6 +288,7 @@ class MainService : Service() {
             ?: appFlutterDir().also {
                 prefs.edit().putString(KEY_APP_DIR_CONFIG_PATH, it).apply()
             }
+        Log.d(logTag, "startServer configPath=$configPath")
         FFI.startServer(configPath, "")
 
         createForegroundNotification()
@@ -379,6 +389,10 @@ class MainService : Service() {
                     mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, it)
                 checkMediaPermission()
                 _isReady = true
+                Log.d(logTag, "MediaProjection ready, starting capture")
+                if (!startCapture()) {
+                    Log.w(logTag, "MediaProjection ready but startCapture failed")
+                }
             } ?: let {
                 Log.d(logTag, "getParcelableExtra intent null, invoke requestMediaProjection")
                 requestMediaProjection()
