@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const MDM_MAX_FPS: &str = "mdm-max-fps";
+
 /*
 FPS adjust:
 a. new user connected =>set to INIT_FPS
@@ -321,7 +323,7 @@ impl VideoQoS {
                 user.delay.quick_increase_fps_count = 0;
             }
 
-            fps = fps.clamp(MIN_FPS, highest_fps);
+            fps = fps.clamp(MIN_FPS, highest_fps.min(mdm_max_fps()));
             // first network delay message
             adjust_ratio = user.delay.fps.is_none();
             user.delay.fps = Some(fps);
@@ -397,7 +399,7 @@ impl VideoQoS {
             .min()
             .unwrap_or(FPS);
 
-        fps.clamp(MIN_FPS, MAX_FPS)
+        fps.clamp(MIN_FPS, mdm_max_fps())
     }
 
     // Get latest quality settings from all users
@@ -532,8 +534,18 @@ impl VideoQoS {
         }
 
         // Ensure fps stays within valid range
-        self.fps = fps.clamp(MIN_FPS, highest_fps);
+        self.fps = fps.clamp(MIN_FPS, highest_fps.min(mdm_max_fps()));
     }
+}
+
+fn mdm_max_fps() -> u32 {
+    Config::get_option(MDM_MAX_FPS)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|fps| *fps > 0)
+        .map(|fps| fps.clamp(MIN_FPS, MAX_FPS))
+        .unwrap_or(MAX_FPS)
 }
 
 #[derive(Default, Debug, Clone)]

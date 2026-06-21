@@ -46,6 +46,9 @@ lazy_static::lazy_static! {
 }
 
 pub const ENCODE_NEED_SWITCH: &'static str = "ENCODE_NEED_SWITCH";
+const MDM_CODEC_PREFERENCE: &str = "mdm-codec-preference";
+const MDM_FORCE_HARDWARE: &str = "mdm-force-hardware";
+const MDM_MAX_BITRATE_BPS: &str = "mdm-max-bitrate-bps";
 
 #[derive(Debug, Clone)]
 pub enum EncoderCfg {
@@ -266,7 +269,25 @@ impl Encoder {
             .into_iter()
             .find(|(_, count)| *count == max_count)
             .unwrap_or((PreferCodec::Auto.into(), 0));
-        let preference = most_frequent.enum_value_or(PreferCodec::Auto);
+        let mut preference = most_frequent.enum_value_or(PreferCodec::Auto);
+        let mdm_preference = mdm_codec_preference();
+        let mdm_requested_preference = mdm_preference != PreferCodec::Auto;
+        if mdm_preference != PreferCodec::Auto {
+            log::info!("MDM forced codec preference: {:?}", mdm_preference);
+            preference = mdm_preference;
+        } else if mdm_force_hardware() {
+            if h264_useable {
+                log::info!("MDM forced hardware codec preference: H264");
+                preference = PreferCodec::H264;
+            } else {
+                log::warn!(
+                    "MDM requested hardware H264 but it is unavailable: peer_h264={}, vram={}, hwram={}",
+                    _all_support_h264_decoding,
+                    h264vram_encoding,
+                    h264hw_encoding.is_some()
+                );
+            }
+        }
 
         // auto: h265 > h264 > av1/vp9/vp8
         let av1_test = Config::get_option(hbb_common::config::keys::OPTION_AV1_TEST) != "N";
@@ -290,10 +311,30 @@ impl Encoder {
             }
         }
 
+        let mdm_requested_available = match preference {
+            PreferCodec::VP8 => vp8_useable,
+            PreferCodec::VP9 => true,
+            PreferCodec::AV1 => av1_useable,
+            PreferCodec::H264 => h264_useable,
+            PreferCodec::H265 => h265_useable,
+            PreferCodec::Auto => true,
+        };
         *format = match preference {
-            PreferCodec::VP8 => CodecFormat::VP8,
+            PreferCodec::VP8 => {
+                if vp8_useable {
+                    CodecFormat::VP8
+                } else {
+                    auto_codec
+                }
+            }
             PreferCodec::VP9 => CodecFormat::VP9,
-            PreferCodec::AV1 => CodecFormat::AV1,
+            PreferCodec::AV1 => {
+                if av1_useable {
+                    CodecFormat::AV1
+                } else {
+                    auto_codec
+                }
+            }
             PreferCodec::H264 => {
                 if h264vram_encoding || h264hw_encoding.is_some() {
                     CodecFormat::H264
@@ -310,6 +351,13 @@ impl Encoder {
             }
             PreferCodec::Auto => auto_codec,
         };
+        if mdm_requested_preference && !mdm_requested_available {
+            log::warn!(
+                "MDM requested codec {:?} but it is unavailable for current session; fallback encoder={:?}",
+                preference,
+                *format
+            );
+        }
         if decodings.len() > 0 {
             log::info!(
                 "usable: vp8={vp8_useable}, av1={av1_useable}, h264={h264_useable}, h265={h265_useable}",
@@ -844,6 +892,57 @@ impl Decoder {
             Chroma::I420
         };
         (codec, chroma)
+    }
+}
+
+fn mdm_codec_preference() -> PreferCodec {
+    match Config::get_option(MDM_CODEC_PREFERENCE)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "vp8" => PreferCodec::VP8,
+        "vp9" => PreferCodec::VP9,
+        "av1" => PreferCodec::AV1,
+        "h264" => PreferCodec::H264,
+        "h265" => PreferCodec::H265,
+        _ => PreferCodec::Auto,
+    }
+}
+
+fn mdm_force_hardware() -> bool {
+    matches!(
+        Config::get_option(MDM_FORCE_HARDWARE)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
+}
+
+pub fn mdm_max_bitrate_kbps() -> Option<u32> {
+    let value = Config::get_option(MDM_MAX_BITRATE_BPS);
+    let bps = value.trim().parse::<u32>().ok()?;
+    if bps == 0 {
+        return None;
+    }
+    Some((bps / 1000).clamp(64, 10_000))
+}
+
+pub fn clamp_mdm_bitrate_kbps(codec: &str, bitrate_kbps: u32) -> u32 {
+    let Some(max_kbps) = mdm_max_bitrate_kbps() else {
+        return bitrate_kbps;
+    };
+    if bitrate_kbps > max_kbps {
+        log::info!(
+            "MDM bitrate cap applied: codec={}, requested={}kbps, capped={}kbps",
+            codec,
+            bitrate_kbps,
+            max_kbps
+        );
+        max_kbps
+    } else {
+        bitrate_kbps
     }
 }
 

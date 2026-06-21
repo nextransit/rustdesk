@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    codec::{enable_vram_option, EncoderApi, EncoderCfg},
+    codec::{clamp_mdm_bitrate_kbps, enable_vram_option, EncoderApi, EncoderCfg},
     hwcodec::HwCodecConfig,
     AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
@@ -284,7 +284,20 @@ impl VRamEncoder {
     }
 
     pub fn bitrate(fmt: DataFormat, width: usize, height: usize, ratio: f32) -> u32 {
-        crate::hwcodec::HwRamEncoder::calc_bitrate(width, height, ratio, fmt == DataFormat::H264)
+        let codec = match fmt {
+            DataFormat::H264 => "vram-h264",
+            DataFormat::H265 => "vram-h265",
+            _ => "vram",
+        };
+        clamp_mdm_bitrate_kbps(
+            codec,
+            crate::hwcodec::HwRamEncoder::calc_bitrate(
+                width,
+                height,
+                ratio,
+                fmt == DataFormat::H264,
+            ),
+        )
     }
 
     pub fn set_not_use(video_service_name: String, not_use: bool) {

@@ -8,7 +8,7 @@ use hbb_common::log;
 use hbb_common::message_proto::{Chroma, EncodedVideoFrame, EncodedVideoFrames, VideoFrame};
 use hbb_common::ResultType;
 
-use crate::codec::{base_bitrate, codec_thread_num, EncoderApi};
+use crate::codec::{base_bitrate, clamp_mdm_bitrate_kbps, codec_thread_num, EncoderApi};
 use crate::{EncodeInput, EncodeYuvFormat, GoogleImage, Pixfmt, STRIDE_ALIGN};
 
 use super::vpx::{vp8e_enc_control_id::*, vpx_codec_err_t::*, *};
@@ -313,7 +313,7 @@ impl VpxEncoder {
 
     fn bitrate(width: u32, height: u32, ratio: f32) -> u32 {
         let bitrate = base_bitrate(width, height) as f32;
-        (bitrate * ratio) as u32
+        clamp_mdm_bitrate_kbps("vpx", (bitrate * ratio) as u32)
     }
 
     #[inline]

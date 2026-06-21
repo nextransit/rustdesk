@@ -78,12 +78,90 @@ class MdmControlProvider : ContentProvider() {
         // Let RustDesk write its own config as the app uid. MDM agent cannot
         // write RustDesk private files directly on non-root devices.
         val appDir = configDir()
-        val ok = FFI.setOption(appDir.absolutePath, "custom-rendezvous-server", hbbs) &&
-            FFI.setOption(appDir.absolutePath, "relay-server", hbbr) &&
-            FFI.setOption(appDir.absolutePath, "key", key)
-        require(ok) { "set RustDesk server options failed" }
+        val options = linkedMapOf(
+            "custom-rendezvous-server" to hbbs,
+            "relay-server" to hbbr,
+            "key" to key
+        )
+        options.putAll(managedStreamOptions(extras))
+        val failed = options.filterNot { (optionKey, optionValue) ->
+            FFI.setOption(appDir.absolutePath, optionKey, optionValue)
+        }.keys
+        val ok = failed.isEmpty()
+        require(ok) { "set RustDesk server options failed: ${failed.joinToString(",")}" }
+        Log.i(
+            TAG,
+            "MDM RustDesk options applied: hbbs=$hbbs hbbr=$hbbr " +
+                "codec=${options["mdm-codec-preference"].orEmpty()} " +
+                "fps=${options["mdm-max-fps"].orEmpty()} " +
+                "bitrate=${options["mdm-max-bitrate-bps"].orEmpty()}"
+        )
         FFI.startServer(appDir.absolutePath, "")
         return success(File(appDir, RUSTDESK2_TOML))
+    }
+
+    private fun managedStreamOptions(extras: Bundle?): LinkedHashMap<String, String> {
+        val codec = extras.stringExtra(EXTRA_CODEC_PREFERENCE, "h264")
+            .lowercase()
+            .takeIf { it in setOf("auto", "vp8", "vp9", "av1", "h264", "h265") }
+            ?: "h264"
+        val audioEnabled = extras.booleanExtra(EXTRA_AUDIO_ENABLED, false)
+        val fileTransferEnabled = extras.booleanExtra(EXTRA_FILE_TRANSFER_ENABLED, false)
+        val tcpTunnelEnabled = extras.booleanExtra(EXTRA_TCP_TUNNEL_ENABLED, false)
+        val maxBitrateBps = extras.intExtra(EXTRA_MAX_BITRATE_BPS, 600_000, 250_000, 3_000_000)
+        val maxFps = extras.intExtra(EXTRA_MAX_FPS, 10, 1, 30)
+        val idleFps = extras.intExtra(EXTRA_IDLE_FPS, 1, 1, 5)
+        val customImageQuality = extras.intExtra(EXTRA_CUSTOM_IMAGE_QUALITY, 30, 20, 80)
+        val imageQuality = extras.stringExtra(EXTRA_IMAGE_QUALITY, "custom")
+            .lowercase()
+            .takeIf { it in setOf("low", "balanced", "best", "custom") }
+            ?: "custom"
+        val preferHardware = codec == "auto" || codec == "h264" || codec == "h265"
+
+        return linkedMapOf(
+            "enable-hwcodec" to boolOption(preferHardware),
+            "codec-preference" to codec,
+            "image_quality" to imageQuality,
+            "custom_image_quality" to customImageQuality.toString(),
+            "custom-fps" to maxFps.toString(),
+            "enable-audio" to boolOption(audioEnabled),
+            "audio-input" to "",
+            "enable-file-transfer" to boolOption(fileTransferEnabled),
+            "enable-tunnel" to boolOption(tcpTunnelEnabled),
+            "mdm-stream-quality" to extras.stringExtra(EXTRA_STREAM_QUALITY, "saving"),
+            "mdm-max-bitrate-bps" to maxBitrateBps.toString(),
+            "mdm-max-fps" to maxFps.toString(),
+            "mdm-idle-fps" to idleFps.toString(),
+            "mdm-scale-resolution-down-by" to extras.doubleExtra(EXTRA_SCALE_DOWN_BY, 2.2, 1.0, 4.0).toString(),
+            "mdm-image-quality" to imageQuality,
+            "mdm-custom-image-quality" to customImageQuality.toString(),
+            "mdm-codec-preference" to codec,
+            "mdm-force-hardware" to boolOption(preferHardware),
+            "mdm-audio-enabled" to boolOption(audioEnabled),
+            "mdm-file-transfer-enabled" to boolOption(fileTransferEnabled),
+            "mdm-tcp-tunnel-enabled" to boolOption(tcpTunnelEnabled),
+            "mdm-connection-strategy" to extras.stringExtra(EXTRA_CONNECTION_STRATEGY, "direct-first"),
+            "mdm-transport" to extras.stringExtra(EXTRA_TRANSPORT, "auto"),
+            "mdm-mtu" to extras.intExtra(EXTRA_MTU, 1350, 1200, 1500).toString()
+        )
+    }
+
+    private fun boolOption(value: Boolean): String = if (value) "Y" else "N"
+
+    private fun Bundle?.stringExtra(key: String, fallback: String): String {
+        return this?.getString(key)?.trim()?.takeIf { it.isNotBlank() } ?: fallback
+    }
+
+    private fun Bundle?.booleanExtra(key: String, fallback: Boolean): Boolean {
+        return this?.getBoolean(key, fallback) ?: fallback
+    }
+
+    private fun Bundle?.intExtra(key: String, fallback: Int, min: Int, max: Int): Int {
+        return (this?.getInt(key, fallback) ?: fallback).coerceIn(min, max)
+    }
+
+    private fun Bundle?.doubleExtra(key: String, fallback: Double, min: Double, max: Double): Double {
+        return (this?.getDouble(key, fallback) ?: fallback).coerceIn(min, max)
     }
 
     private fun setSessionPassword(extras: Bundle?): Bundle {
@@ -374,6 +452,20 @@ class MdmControlProvider : ContentProvider() {
         private const val EXTRA_KEY = "key"
         private const val EXTRA_PASSWORD = "password"
         private const val EXTRA_FROM_BOOT = "from_boot"
+        private const val EXTRA_STREAM_QUALITY = "stream_quality"
+        private const val EXTRA_MAX_BITRATE_BPS = "max_bitrate_bps"
+        private const val EXTRA_MAX_FPS = "max_fps"
+        private const val EXTRA_IDLE_FPS = "idle_fps"
+        private const val EXTRA_SCALE_DOWN_BY = "scale_resolution_down_by"
+        private const val EXTRA_IMAGE_QUALITY = "image_quality"
+        private const val EXTRA_CUSTOM_IMAGE_QUALITY = "custom_image_quality"
+        private const val EXTRA_CODEC_PREFERENCE = "codec_preference"
+        private const val EXTRA_AUDIO_ENABLED = "audio_enabled"
+        private const val EXTRA_FILE_TRANSFER_ENABLED = "file_transfer_enabled"
+        private const val EXTRA_TCP_TUNNEL_ENABLED = "tcp_tunnel_enabled"
+        private const val EXTRA_CONNECTION_STRATEGY = "connection_strategy"
+        private const val EXTRA_TRANSPORT = "transport"
+        private const val EXTRA_MTU = "mtu"
 
         private const val KEY_SUCCESS = "success"
         private const val KEY_ERROR = "error"

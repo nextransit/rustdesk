@@ -6,7 +6,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/aom_ffi.rs"));
 
-use crate::codec::{base_bitrate, codec_thread_num};
+use crate::codec::{base_bitrate, clamp_mdm_bitrate_kbps, codec_thread_num};
 use crate::{codec::EncoderApi, EncodeFrame, STRIDE_ALIGN};
 use crate::{common::GoogleImage, generate_call_macro, generate_call_ptr_macro, Error, Result};
 use crate::{EncodeInput, EncodeYuvFormat, Pixfmt};
@@ -346,7 +346,7 @@ impl AomEncoder {
 
     fn bitrate(width: u32, height: u32, ratio: f32) -> u32 {
         let bitrate = base_bitrate(width, height) as f32;
-        (bitrate * ratio) as u32
+        clamp_mdm_bitrate_kbps("av1", (bitrate * ratio) as u32)
     }
 
     #[inline]
