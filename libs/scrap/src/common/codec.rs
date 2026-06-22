@@ -269,26 +269,43 @@ impl Encoder {
         let preference = most_frequent.enum_value_or(PreferCodec::Auto);
 
         // auto: h265 > h264 > av1/vp9/vp8
-        let av1_test = Config::get_option(hbb_common::config::keys::OPTION_AV1_TEST) != "N";
-        let mut auto_codec = if av1_useable && av1_test {
-            CodecFormat::AV1
-        } else {
-            CodecFormat::VP9
-        };
-        if h264_useable {
-            auto_codec = CodecFormat::H264;
-        }
-        if h265_useable {
-            auto_codec = CodecFormat::H265;
-        }
-        if auto_codec == CodecFormat::VP9 || auto_codec == CodecFormat::AV1 {
-            let mut system = System::new();
-            system.refresh_memory();
-            if vp8_useable && system.total_memory() <= 4 * 1024 * 1024 * 1024 {
-                // 4 Gb
-                auto_codec = CodecFormat::VP8
+        // Android 平台: 跳过错综复杂且 CPU 高的 VP9/AV1, 直接走硬件编码
+        #[cfg(target_os = "android")]
+        let mut auto_codec = {
+            if h265_useable {
+                CodecFormat::H265  // MediaCodec H265 硬件编码器
+            } else if h264_useable {
+                CodecFormat::H264  // MediaCodec H264 硬件编码器
+            } else if vp8_useable {
+                CodecFormat::VP8   // 纯软件兜底
+            } else {
+                CodecFormat::VP9
             }
-        }
+        };
+        #[cfg(not(target_os = "android"))]
+        let mut auto_codec = {
+            let av1_test = Config::get_option(hbb_common::config::keys::OPTION_AV1_TEST) != "N";
+            let mut codec = if av1_useable && av1_test {
+                CodecFormat::AV1
+            } else {
+                CodecFormat::VP9
+            };
+            if h264_useable {
+                codec = CodecFormat::H264;
+            }
+            if h265_useable {
+                codec = CodecFormat::H265;
+            }
+            if codec == CodecFormat::VP9 || codec == CodecFormat::AV1 {
+                let mut system = System::new();
+                system.refresh_memory();
+                if vp8_useable && system.total_memory() <= 4 * 1024 * 1024 * 1024 {
+                    // 4 Gb - low memory fallback to VP8
+                    codec = CodecFormat::VP8
+                }
+            }
+            codec
+        };
 
         *format = match preference {
             PreferCodec::VP8 => CodecFormat::VP8,
@@ -332,6 +349,10 @@ impl Encoder {
         #[allow(unused_mut)]
         let mut encoding = SupportedEncoding {
             vp8: true,
+            // Android: VP9/AV1 纯软件编码器消耗极高, 跳过广告以避免 server 选择
+            #[cfg(target_os = "android")]
+            av1: false,
+            #[cfg(not(target_os = "android"))]
             av1: !disable_av1(),
             i444: Some(CodecAbility {
                 vp9: true,
@@ -341,6 +362,11 @@ impl Encoder {
             .into(),
             ..Default::default()
         };
+        // Android: I444 太昂贵, 禁用
+        #[cfg(target_os = "android")]
+        {
+            encoding.i444 = None;
+        }
         #[cfg(feature = "hwcodec")]
         if enable_hwcodec_option() {
             encoding.h264 |= HwRamEncoder::try_get(CodecFormat::H264).is_some();
@@ -894,11 +920,27 @@ pub const BR_BEST: f32 = 1.5;
 pub const BR_BALANCED: f32 = 0.67;
 pub const BR_SPEED: f32 = 0.5;
 
+// — 公交车载场景专用常量 —
+//
+// 场景特征: 4G LTE → 信号波动 1-10 Mbps, 有月度流量限额,
+// 多台车载机共用同一 APN。 画面多为静态 (停车/行驶中少变化)。
+//
+// BR_BUS_LOW:      15% 基线码率 → 1080p 下行 ~310 kbps，720p 下行 ~150 kbps
+// BR_BUS_ULTRA:    8% 基线码率  → 1080p 下行 ~165 kbps，720p 下行 ~80 kbps
+// BR_BUS_PAUSED:   4% 基线码率  → 车辆静止/隧道/盲区，仅保连接
+pub const BR_BUS_LOW: f32 = 0.15;
+pub const BR_BUS_ULTRA: f32 = 0.08;
+pub const BR_BUS_PAUSED: f32 = 0.04;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Quality {
     Best,
     Balanced,
     Low,
+    /// 公交车载模式: 超低码率 (BR_BUS_LOW / BR_BUS_ULTRA)
+    Bus,
+    /// 公交车载停车/盲区模式: 极低码率仅保连接 (BR_BUS_PAUSED)
+    BusPaused,
     Custom(f32),
 }
 
@@ -921,6 +963,8 @@ impl Quality {
             Quality::Best => BR_BEST,
             Quality::Balanced => BR_BALANCED,
             Quality::Low => BR_SPEED,
+            Quality::Bus => BR_BUS_LOW,
+            Quality::BusPaused => BR_BUS_PAUSED,
             Quality::Custom(v) => *v,
         }
     }

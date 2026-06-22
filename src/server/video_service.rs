@@ -652,9 +652,16 @@ fn run(vs: VideoService) -> ResultType<()> {
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
-    let capture_width = c.width;
-    let capture_height = c.height;
-    let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+	let capture_width = c.width;
+	let capture_height = c.height;
+	let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+
+	// — 公交车载: 静态画面帧跳过 —
+	// 车辆静止时画面几乎不变, 跳过编码可节省 80-90% 流量.
+	// last_yuv_hash: 前帧 YUV 数据的采样哈希, 用于判断画面是否变化.
+	let mut last_yuv_hash: u64 = 0;
+	let mut static_frame_count: u32 = 0;
+	let mut last_keyframe_instant: Instant = Instant::now();
 
     while sp.ok() {
         #[cfg(windows)]
@@ -769,6 +776,42 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
 
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+
+                    // — 公交车载: 静态画面帧跳过 (仅 bus_mode 生效) —
+                    // 对 YUV 数据进行均匀采样比较, 如果画面无显著变化且强制刷新周期未到, 跳过编码.
+                    {
+                        let video_qos = VIDEO_QOS.lock().unwrap();
+                        let skip = video_qos.is_bus_mode() && !first_frame;
+                        drop(video_qos);
+                        if skip {
+                            // 采样 hash: 均匀取 Y 平面 64 个位置
+                            let y_len = yuv.len().min(capture_width as usize * capture_height as usize);
+                            let step = (y_len / 64).max(4) as usize;
+                            let mut hash: u64 = 5381;
+                            let mut i = 0;
+                            while i < y_len {
+                                hash = hash.wrapping_mul(33).wrapping_add(yuv[i] as u64);
+                                i += step;
+                            }
+                            if hash == last_yuv_hash {
+                                static_frame_count += 1;
+                            } else {
+                                last_yuv_hash = hash;
+                                static_frame_count = 0;
+                            }
+                            // 静态画面: 每 60 帧强制发送一次 (保证连接不断)
+                            // 或者最近一次发帧已过 2 秒
+                            let force_send = static_frame_count >= 60
+                                || last_keyframe_instant.elapsed().as_secs() >= 2;
+                            if static_frame_count > 0 && !force_send {
+                                // 跳过编码, 不发送
+                                frame_controller.set_send(now, HashSet::new());
+                                continue;
+                            }
+                            last_keyframe_instant = Instant::now();
+                        }
+                    }
+
                     let send_conn_ids = handle_one_frame(
                         display_idx,
                         &sp,

@@ -1,5 +1,7 @@
 use super::*;
-use scrap::codec::{Quality, BR_BALANCED, BR_BEST, BR_SPEED};
+use scrap::codec::{
+    Quality, BR_BALANCED, BR_BEST, BR_BUS_LOW, BR_BUS_PAUSED, BR_BUS_ULTRA, BR_SPEED,
+};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -27,11 +29,24 @@ delay:
     use delay minus RTT as the actual network delay
 */
 
-// Constants
+// Standard mode constants
 pub const FPS: u32 = 30;
 pub const MIN_FPS: u32 = 1;
+pub const MIN_FPS_HALF: u32 = 1; // 0.5 FPS for extreme low-bandwidth (flag-controlled)
 pub const MAX_FPS: u32 = 120;
 pub const INIT_FPS: u32 = 15;
+
+// Bus mode constants
+/// 公交车载初始帧率 (传统 15 FPS → 3 FPS, 首帧等待用户授权后瞬间跳升)
+pub const BUS_INIT_FPS: u32 = 3;
+/// 公交车载帧率上限
+pub const BUS_MAX_FPS: u32 = 10;
+/// 公交车载帧率下限 (0.5 FPS, 仅需保连接)
+pub const BUS_MIN_FPS: u32 = 1;
+/// 公交车载网络阈值 (传统 150ms → 80ms, 4G 网络更脆弱)
+pub const BUS_DELAY_THRESHOLD_80MS: u32 = 80;
+/// 公交车载 Ratio 下限 (传统 0.1 → 0.04)
+pub const BR_BUS_RATIO_FLOOR: f32 = 0.04;
 
 // Bitrate ratio constants for different quality levels
 const BR_MAX: f32 = 40.0; // 2000 * 2 / 100
@@ -111,6 +126,11 @@ pub struct VideoQoS {
     adjust_ratio_instant: Instant,
     abr_config: bool,
     new_user_instant: Instant,
+    /// true 时启用公交车载超低带宽模式:
+    ///   - lower init_fps (3), lower max_fps (10), lower ratio floor (0.04)
+    ///   - aggressive fps/ratio reduction at lower network delay threshold
+    ///   - 禁用音频/剪贴板/文件传输
+    bus_mode: bool,
 }
 
 impl Default for VideoQoS {
@@ -124,12 +144,26 @@ impl Default for VideoQoS {
             adjust_ratio_instant: Instant::now(),
             abr_config: true,
             new_user_instant: Instant::now(),
+            bus_mode: false,
         }
     }
 }
 
 // Basic functionality
 impl VideoQoS {
+    /// 启用/禁用公交车载超低带宽模式
+    pub fn set_bus_mode(&mut self, enabled: bool) {
+        self.bus_mode = enabled;
+        if enabled {
+            let bus_init = BUS_INIT_FPS.min(BUS_MAX_FPS).max(MIN_FPS);
+            self.fps = bus_init;
+            self.ratio = BR_BUS_LOW;
+        }
+    }
+
+    pub fn is_bus_mode(&self) -> bool {
+        self.bus_mode
+    }
     // Calculate seconds per frame based on current FPS
     pub fn spf(&self) -> Duration {
         Duration::from_secs_f32(1. / (self.fps() as f32))
@@ -138,7 +172,8 @@ impl VideoQoS {
     // Get current FPS within valid range
     pub fn fps(&self) -> u32 {
         let fps = self.fps;
-        if fps >= MIN_FPS && fps <= MAX_FPS {
+        let max = if self.bus_mode { BUS_MAX_FPS } else { MAX_FPS };
+        if fps >= MIN_FPS && fps <= max {
             fps
         } else {
             FPS
@@ -157,7 +192,12 @@ impl VideoQoS {
 
     // Get current bitrate ratio with bounds checking
     pub fn ratio(&mut self) -> f32 {
-        if self.ratio < BR_MIN_HIGH_RESOLUTION || self.ratio > BR_MAX {
+        let ratio_floor = if self.bus_mode {
+            BR_BUS_RATIO_FLOOR
+        } else {
+            BR_MIN_HIGH_RESOLUTION
+        };
+        if self.ratio < ratio_floor || self.ratio > BR_MAX {
             self.ratio = BR_BALANCED;
         }
         self.ratio
@@ -187,6 +227,11 @@ impl VideoQoS {
         self.users.insert(id, UserData::default());
         self.abr_config = Config::get_option("enable-abr") != "N";
         self.new_user_instant = Instant::now();
+        if self.bus_mode {
+            let bus_init = BUS_INIT_FPS.min(BUS_MAX_FPS).max(MIN_FPS);
+            self.fps = bus_init;
+            self.ratio = BR_BUS_LOW;
+        }
     }
 
     // Clean up user session
@@ -247,8 +292,10 @@ impl VideoQoS {
         let highest_fps = self.highest_fps();
         let target_ratio = self.latest_quality().ratio();
 
-        // For bad network, small fps means quick reaction and high quality
-        let (min_fps, normal_fps) = if target_ratio >= BR_BEST {
+        // 公交车载模式: 使用更低的 min_fps/normal_fps
+        let (min_fps, normal_fps) = if self.bus_mode {
+            (1, 3)     // bus: min=1 FPS, normal=3 FPS
+        } else if target_ratio >= BR_BEST {
             (8, 16)
         } else if target_ratio >= BR_BALANCED {
             (10, 20)
@@ -256,8 +303,15 @@ impl VideoQoS {
             (12, 24)
         };
 
+        // 公交车载模式: 使用更低的延迟阈值 80ms 而非 150ms
+        let delay_threshold = if self.bus_mode {
+            BUS_DELAY_THRESHOLD_80MS
+        } else {
+            DELAY_THRESHOLD_150MS
+        };
+
         // Calculate minimum acceptable delay-fps product
-        let dividend_ms = DELAY_THRESHOLD_150MS * min_fps;
+        let dividend_ms = delay_threshold * min_fps;
 
         let mut adjust_ratio = false;
         if let Some(user) = self.users.get_mut(&id) {
@@ -269,7 +323,8 @@ impl VideoQoS {
             let mut fps = self.fps;
 
             // Adaptive FPS adjustment based on network delay:
-            if avg_delay < 50 {
+            let threshold_ms = if self.bus_mode { 40u32 } else { 50u32 };
+            if avg_delay < threshold_ms {
                 user.delay.quick_increase_fps_count += 1;
                 let mut step = if fps < normal_fps { 1 } else { 0 };
                 if user.delay.quick_increase_fps_count >= 3 {
@@ -278,7 +333,7 @@ impl VideoQoS {
                     step = 5;
                 }
                 fps = min_fps.max(fps + step);
-            } else if avg_delay < 100 {
+            } else if avg_delay < threshold_ms * 2 {
                 let step = if avg_delay < old_avg_delay {
                     if fps < normal_fps {
                         1
@@ -289,23 +344,23 @@ impl VideoQoS {
                     0
                 };
                 fps = min_fps.max(fps + step);
-            } else if avg_delay < DELAY_THRESHOLD_150MS {
+            } else if avg_delay < delay_threshold {
                 fps = min_fps.max(fps);
             } else {
-                let devide_fps = ((fps as f32) / (avg_delay as f32 / DELAY_THRESHOLD_150MS as f32))
+                let devide_fps = ((fps as f32) / (avg_delay as f32 / delay_threshold as f32))
                     .ceil() as u32;
-                if avg_delay < 200 {
+                if avg_delay < delay_threshold * 4 / 3 {
                     fps = min_fps.max(devide_fps);
-                } else if avg_delay < 300 {
+                } else if avg_delay < delay_threshold * 2 {
                     fps = min_fps.min(devide_fps);
-                } else if avg_delay < 600 {
+                } else if avg_delay < delay_threshold * 4 {
                     fps = dividend_ms / avg_delay;
                 } else {
                     fps = (dividend_ms / avg_delay).min(devide_fps);
                 }
             }
 
-            if avg_delay < DELAY_THRESHOLD_150MS {
+            if avg_delay < delay_threshold {
                 user.delay.increase_fps_count += 1;
             } else {
                 user.delay.increase_fps_count = 0;
@@ -317,7 +372,7 @@ impl VideoQoS {
             }
 
             // Reset quick increase counter if network condition worsens
-            if avg_delay > 50 {
+            if avg_delay > threshold_ms {
                 user.delay.quick_increase_fps_count = 0;
             }
 
@@ -442,52 +497,64 @@ impl VideoQoS {
             None
         };
 
-        // Set minimum ratio based on quality mode
-        let min = match target_quality {
-            Quality::Best => {
-                // For Best quality, ensure minimum 1Mbps for high resolution
-                let mut min = BR_BEST / 2.5;
-                if let Some(ratio_1mbps) = ratio_1mbps {
-                    if min > ratio_1mbps {
-                        min = ratio_1mbps;
+        // Set minimum ratio based on quality mode and bus mode
+        let min = if self.bus_mode {
+            // 公交车载: 允许更低的 ratio 下限
+            BR_BUS_RATIO_FLOOR
+        } else {
+            match target_quality {
+                Quality::Best => {
+                    // For Best quality, ensure minimum 1Mbps for high resolution
+                    let mut min = BR_BEST / 2.5;
+                    if let Some(ratio_1mbps) = ratio_1mbps {
+                        if min > ratio_1mbps {
+                            min = ratio_1mbps;
+                        }
                     }
+                    min.max(BR_MIN)
                 }
-                min.max(BR_MIN)
-            }
-            Quality::Balanced => {
-                let mut min = (BR_BALANCED / 2.0).min(0.4);
-                if let Some(ratio_1mbps) = ratio_1mbps {
-                    if min > ratio_1mbps {
-                        min = ratio_1mbps;
+                Quality::Balanced => {
+                    let mut min = (BR_BALANCED / 2.0).min(0.4);
+                    if let Some(ratio_1mbps) = ratio_1mbps {
+                        if min > ratio_1mbps {
+                            min = ratio_1mbps;
+                        }
                     }
+                    min.max(BR_MIN_HIGH_RESOLUTION)
                 }
-                min.max(BR_MIN_HIGH_RESOLUTION)
+                Quality::Low | Quality::Bus | Quality::BusPaused => BR_MIN_HIGH_RESOLUTION,
+                Quality::Custom(_) => BR_MIN_HIGH_RESOLUTION,
             }
-            Quality::Low => BR_MIN_HIGH_RESOLUTION,
-            Quality::Custom(_) => BR_MIN_HIGH_RESOLUTION,
         };
         let max = target_ratio * MAX_BR_MULTIPLE;
 
         let mut v = current_ratio;
 
         // Adjust ratio based on network delay thresholds
-        if max_delay < 50 {
+        // 公交车载: 使用更敏感的延迟阈值
+        let stable_threshold = if self.bus_mode { 40u32 } else { 50u32 };
+        let moderate_threshold = if self.bus_mode {
+            BUS_DELAY_THRESHOLD_80MS
+        } else {
+            DELAY_THRESHOLD_150MS
+        };
+        if max_delay < stable_threshold {
             if dynamic_screen {
                 v = current_ratio * 1.15;
             }
-        } else if max_delay < 100 {
+        } else if max_delay < stable_threshold * 2 {
             if dynamic_screen {
                 v = current_ratio * 1.1;
             }
-        } else if max_delay < DELAY_THRESHOLD_150MS {
+        } else if max_delay < moderate_threshold {
             if dynamic_screen {
                 v = current_ratio * 1.05;
             }
-        } else if max_delay < 200 {
+        } else if max_delay < moderate_threshold * 4 / 3 {
             v = current_ratio * 0.95;
-        } else if max_delay < 300 {
+        } else if max_delay < moderate_threshold * 2 {
             v = current_ratio * 0.9;
-        } else if max_delay < 500 {
+        } else if max_delay < moderate_threshold * 3 {
             v = current_ratio * 0.85;
         } else {
             v = current_ratio * 0.8;
@@ -509,7 +576,11 @@ impl VideoQoS {
 
     // Adjust fps based on network delay and user response time
     fn adjust_fps(&mut self) {
-        let highest_fps = self.highest_fps();
+        let highest_fps = if self.bus_mode {
+            BUS_MAX_FPS
+        } else {
+            self.highest_fps()
+        };
         // Get minimum fps from all users
         let mut fps = self
             .users
@@ -519,15 +590,17 @@ impl VideoQoS {
             .unwrap_or(INIT_FPS);
 
         if self.users.iter().any(|u| u.1.delay.response_delayed) {
-            if fps > MIN_FPS + 1 {
-                fps = MIN_FPS + 1;
+            let min_allowed = if self.bus_mode { MIN_FPS } else { MIN_FPS + 1 };
+            if fps > min_allowed {
+                fps = min_allowed;
             }
         }
 
         // For new connections (within 1 second), cap fps to INIT_FPS to ensure stability
+        let init_limit = if self.bus_mode { BUS_INIT_FPS } else { INIT_FPS };
         if self.new_user_instant.elapsed().as_secs() < 1 {
-            if fps > INIT_FPS {
-                fps = INIT_FPS;
+            if fps > init_limit {
+                fps = init_limit;
             }
         }
 
