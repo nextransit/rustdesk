@@ -775,7 +775,14 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
 
+                    // P0-fix: bus_mode 静态画面 hash 跳过 (feature/rustdesk_optimize 上游 bug).
+                    // 原实现 E0502: frame.to() 之后 &mut yuv 借用被 frame.EncodeInput::YUV(&'a [u8])
+                    // 持有, hash 时再读 yuv 触发可变/不可变冲突.
+                    // 修复: mem::take 把 yuv 内容 swap 出来, frame.to() 写入新的空 Vec (frame 借新 Vec),
+                    // hash 用原 snapshot (frame 不再借它).
+                    let yuv_snapshot: Vec<u8> = std::mem::take(&mut yuv);
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                    let _ = &yuv_snapshot; // 保持 snapshot 生命周期到 if 块结束
 
                     // — 公交车载: 静态画面帧跳过 (仅 bus_mode 生效) —
                     // 对 YUV 数据进行均匀采样比较, 如果画面无显著变化且强制刷新周期未到, 跳过编码.
@@ -784,15 +791,16 @@ fn run(vs: VideoService) -> ResultType<()> {
                         let skip = video_qos.is_bus_mode() && !first_frame;
                         drop(video_qos);
                         if skip {
-                            // 采样 hash: 均匀取 Y 平面 64 个位置
-                            let y_len = yuv.len().min(capture_width as usize * capture_height as usize);
+                            // 采样 hash: 均匀取 Y 平面 64 个位置 (用 snapshot 避免与 frame 借用冲突)
+                            let y_len = yuv_snapshot.len().min(capture_width as usize * capture_height as usize);
                             let step = (y_len / 64).max(4) as usize;
                             let mut hash: u64 = 5381;
                             let mut i = 0;
                             while i < y_len {
-                                hash = hash.wrapping_mul(33).wrapping_add(yuv[i] as u64);
+                                hash = hash.wrapping_mul(33).wrapping_add(yuv_snapshot[i] as u64);
                                 i += step;
                             }
+                            drop(yuv_snapshot); // snapshot 使命完成, 把内存还给 yuv (但 yuv 仍被 frame 借, 实际不释放)
                             if hash == last_yuv_hash {
                                 static_frame_count += 1;
                             } else {

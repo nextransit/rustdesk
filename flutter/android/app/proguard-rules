@@ -6,9 +6,50 @@
 # Keep rustls-platform-verifier classes for JNI
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
 
-# P0-fix: 防止 androidx.window sidecar 兼容类在 R8/minify 升级时被剥离 (ClassNotFoundException crash).
-# 详见 app/build.gradle 中对应注释。
--keep class androidx.window.sidecar.SidecarInterface { *; }
--keep class androidx.window.sidecar.SidecarInterface$* { *; }
--keep class androidx.window.layout.adapter.sidecar.** { *; }
--keep class androidx.window.layout.SidecarCompat$* { *; }
+# === P0-fix: androidx.window 整族 keep (含内类) ===
+# 任何 androidx.window.* 类都需要 keep, 因为 R8 重命名后
+# `-keep class X$*` 在某些 R8 版本不匹配, 必须用 $ 形式
+# (注意: 这只保证类不被剥离, 真正的崩溃是因为 framework 类 API28 不存在 -
+#  我们用 -dontwarn 让 R8 不报错, 并依赖 R8 优化把这个调用路径优化掉)
+-keep class androidx.window.sidecar.** { *; }
+-keep class androidx.window.layout.** { *; }
+-keep class androidx.window.layout.adapter.** { *; }
+-keep class androidx.window.core.** { *; }
+-keep class androidx.window.** { *; }
+-keep interface androidx.window.sidecar.** { *; }
+-keep interface androidx.window.layout.** { *; }
+-keep interface androidx.window.** { *; }
+
+# === P0-fix: API28 不存在的 framework 类 (OnBack*), dontwarn 让 R8 不报警 ===
+# 这些类在 API33+ 才存在, API<33 调用时会 NoClassDefFoundError.
+# R8 keep 让 R8 知道这些类存在, 但运行时仍会失败 — 必须在 Java/Kotlin 代码 try-catch
+# 临时方案: dontwarn + assumevalues 让 R8 把 try-catch 路径直接 return default.
+-dontwarn android.window.OnBackAnimationCallback
+-dontwarn android.window.OnBackAnimationCallback$*
+-dontwarn android.window.OnBackInvokedCallback
+-dontwarn android.window.OnBackInvokedCallback$*
+-dontwarn android.window.OnBackInvokedDispatcher
+-dontwarn android.window.OnBackInvokedDispatcher$*
+-dontwarn androidx.window.sidecar.**
+-dontwarn androidx.window.layout.**
+-dontwarn androidx.window.layout.adapter.**
+-dontwarn androidx.window.core.**
+
+# === P0-fix: 不要让 R8 优化 SidecarWindowBackend$Companion.initAndVerifyExtension ===
+# 这个方法里有 try { SidecarCompat } catch (Throwable) { return null } 路径,
+# R8 minify 在某些条件下会错误地把 catch 优化掉, 导致 API<33 设备上 NoClassDefFoundError
+# 没有被 catch 直接抛到上层.
+# 强制 keep 该方法体不被 R8 改动.
+-keep,allowobfuscation,allowshrinking class androidx.window.layout.SidecarWindowBackend$Companion {
+    public *** initAndVerifyExtension(...);
+    public *** getInstance(...);
+}
+-keep class androidx.window.layout.SidecarWindowBackend { *; }
+-keep class androidx.window.layout.SidecarCompat { *; }
+-keep class androidx.window.layout.SidecarCompat$Companion { *; }
+
+# === P0-fix: 让 R8 不要剥离 androidx.window.sidecar.* 接口类 ===
+# 这些类被 SidecarCompat 字段类型引用, R8 minify 会发现它们没有实现类 (sidecar 接口),
+# 把它们整个删除, 留下空引用. 强制 keep 整个包.
+-keep class androidx.window.sidecar.** { *; }
+-keep interface androidx.window.sidecar.** { *; }

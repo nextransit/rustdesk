@@ -1,3 +1,4 @@
+use hbb_common::protobuf;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
@@ -365,7 +366,7 @@ impl Encoder {
         // Android: I444 太昂贵, 禁用
         #[cfg(target_os = "android")]
         {
-            encoding.i444 = None;
+            encoding.i444 = protobuf::MessageField(None);
         }
         #[cfg(feature = "hwcodec")]
         if enable_hwcodec_option() {
