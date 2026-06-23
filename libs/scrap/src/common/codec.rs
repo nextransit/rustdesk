@@ -233,8 +233,22 @@ impl Encoder {
         }
         let h264_useable =
             _all_support_h264_decoding && (h264vram_encoding || h264hw_encoding.is_some());
-        let h265_useable =
-            _all_support_h265_decoding && (h265vram_encoding || h265hw_encoding.is_some());
+        let h265_useable = {
+            // P1-2 fix: previously h265_mediacodec_useable was missing, so on
+            // Android devices with only mediacodec feature (no vram/hwcodec)
+            // h265_useable was always false. Read H265_DECODER_SUPPORT atomic
+            // set during mediacodec::MediaCodecDecoder::test() so we can use
+            // Android MediaCodec H265 path when available.
+            #[cfg(target_os = "android")]
+            let h265_mediacodec_useable = H265_DECODER_SUPPORT
+                .load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(target_os = "android"))]
+            let h265_mediacodec_useable = false;
+            _all_support_h265_decoding
+                && (h265vram_encoding
+                    || h265hw_encoding.is_some()
+                    || h265_mediacodec_useable)
+        };
         let mut format = ENCODE_CODEC_FORMAT.lock().unwrap();
         let preferences: Vec<_> = decodings
             .iter()
