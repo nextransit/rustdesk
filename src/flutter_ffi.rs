@@ -60,7 +60,16 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
                 .with_tag("ffi"), // logs will show under mytag tag
         );
         #[cfg(not(debug_assertions))]
-        hbb_common::init_log(false, "");
+        {
+            // MDM-debug: release 编译也开 android_logger, 方便排查 hbbs 连接问题.
+            // tag=rustdesk 让 MDM agent logcat 能直接过滤.
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_max_level(log::LevelFilter::Debug)
+                    .with_tag("rustdesk"),
+            );
+            hbb_common::init_log(false, "");
+        }
         #[cfg(feature = "mediacodec")]
         scrap::mediacodec::check_mediacodec();
         crate::common::test_rendezvous_server();

@@ -239,10 +239,10 @@ impl Encoder {
             // h265_useable was always false. Read H265_DECODER_SUPPORT atomic
             // set during mediacodec::MediaCodecDecoder::test() so we can use
             // Android MediaCodec H265 path when available.
-            #[cfg(target_os = "android")]
+            #[cfg(all(target_os = "android", feature = "mediacodec"))]
             let h265_mediacodec_useable = H265_DECODER_SUPPORT
                 .load(std::sync::atomic::Ordering::Relaxed);
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(all(target_os = "android", feature = "mediacodec")))]
             let h265_mediacodec_useable = false;
             _all_support_h265_decoding
                 && (h265vram_encoding

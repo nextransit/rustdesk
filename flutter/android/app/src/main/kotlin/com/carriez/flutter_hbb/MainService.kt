@@ -244,11 +244,46 @@ class MainService : Service() {
             get() = _isReady
         val isStart: Boolean
             get() = _isStart
+        val isCapturing: Boolean
+            get() = _isReady && _isStart
         val isAudioStart: Boolean
             get() = _isAudioStart
     }
 
     private val logTag = "LOG_SERVICE"
+    private val mediaProjectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.w(logTag, "MediaProjection callback onStop")
+            markCaptureInactive(
+                reason = "media_projection_on_stop",
+                clearMediaProjection = true,
+                releaseVirtualDisplay = false
+            )
+        }
+    }
+    private val virtualDisplayCallback = object : VirtualDisplay.Callback() {
+        override fun onPaused() {
+            Log.w(logTag, "VirtualDisplay callback onPaused")
+            markCaptureInactive(
+                reason = "virtual_display_paused",
+                clearMediaProjection = false,
+                releaseVirtualDisplay = false
+            )
+        }
+
+        override fun onResumed() {
+            Log.d(logTag, "VirtualDisplay callback onResumed")
+        }
+
+        override fun onStopped() {
+            Log.w(logTag, "VirtualDisplay callback onStopped")
+            markCaptureInactive(
+                reason = "virtual_display_stopped",
+                clearMediaProjection = false,
+                releaseVirtualDisplay = false
+            )
+        }
+    }
     private val useVP9 = false
     private val binder = LocalBinder()
 
@@ -261,6 +296,7 @@ class MainService : Service() {
     private var videoEncoder: MediaCodec? = null
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
+    private var mediaProjectionCallbackRegistered = false
 
     // audio
     private val audioRecordHandle = AudioRecordHandle(this, { isStart }, { isAudioStart })
@@ -385,8 +421,23 @@ class MainService : Service() {
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
             intent.getParcelableExtra<Intent>(EXT_MEDIA_PROJECTION_RES_INTENT)?.let {
-                mediaProjection =
-                    mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, it)
+                if (virtualDisplay != null || isStart) {
+                    markCaptureInactive(
+                        reason = "new_media_projection",
+                        clearMediaProjection = false,
+                        releaseVirtualDisplay = true
+                    )
+                }
+                mediaProjection?.let { existing ->
+                    runCatching { existing.unregisterCallback(mediaProjectionCallback) }
+                    mediaProjectionCallbackRegistered = false
+                }
+                mediaProjection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, it)
+                mediaProjection?.registerCallback(
+                    mediaProjectionCallback,
+                    serviceHandler ?: Handler(Looper.getMainLooper())
+                )
+                mediaProjectionCallbackRegistered = true
                 checkMediaPermission()
                 _isReady = true
                 Log.d(logTag, "MediaProjection ready, starting capture")
@@ -405,7 +456,9 @@ class MainService : Service() {
                 Log.d(logTag, "mdm start: ACT_START_NO_PROJECTION")
                 createForegroundNotification()
                 FFI.startService(appFlutterDir())
-                _isReady = false
+                if (!isStart) {
+                    _isReady = false
+                }
             }
         }
         return START_NOT_STICKY // don't use sticky (auto restart), the new service (from auto restart) will lose control
@@ -469,7 +522,7 @@ class MainService : Service() {
 
     fun startCapture(): Boolean {
         if (isStart) {
-            return true
+            return isReady
         }
         if (mediaProjection == null) {
             Log.w(logTag, "startCapture fail,mediaProjection is null")
@@ -480,11 +533,32 @@ class MainService : Service() {
         updateScreenInfo(resources.configuration.orientation)
         Log.d(logTag, "Start Capture")
         surface = createSurface()
+        if (surface == null) {
+            Log.w(logTag, "startCapture fail,surface is null")
+            markCaptureInactive(
+                reason = "start_capture_surface_null",
+                clearMediaProjection = false,
+                releaseVirtualDisplay = true
+            )
+            return false
+        }
 
-        if (useVP9) {
+        _isStart = true
+        MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
+
+        val recorderStarted = if (useVP9) {
             startVP9VideoRecorder(mediaProjection!!)
         } else {
             startRawVideoRecorder(mediaProjection!!)
+        }
+        if (!recorderStarted || !isStart) {
+            Log.w(logTag, "startCapture failed or capture stopped immediately: recorderStarted=$recorderStarted isStart=$isStart")
+            markCaptureInactive(
+                reason = "start_capture_failed_or_stopped",
+                clearMediaProjection = false,
+                releaseVirtualDisplay = true
+            )
+            return false
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -496,47 +570,67 @@ class MainService : Service() {
             }
         }
         checkMediaPermission()
-        _isStart = true
         FFI.setFrameRawEnable("video",true)
-        MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         return true
     }
 
     @Synchronized
     fun stopCapture() {
-        Log.d(logTag, "Stop Capture")
+        markCaptureInactive(
+            reason = "stop_capture",
+            clearMediaProjection = false,
+            releaseVirtualDisplay = true
+        )
+    }
+
+    @Synchronized
+    private fun markCaptureInactive(
+        reason: String,
+        clearMediaProjection: Boolean,
+        releaseVirtualDisplay: Boolean
+    ) {
+        Log.d(logTag, "Stop Capture reason=$reason clearMediaProjection=$clearMediaProjection releaseVirtualDisplay=$releaseVirtualDisplay")
         FFI.setFrameRawEnable("video",false)
         _isStart = false
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         // release video
-        if (reuseVirtualDisplay) {
-            // The virtual display video projection can be paused by calling `setSurface(null)`.
-            // https://developer.android.com/reference/android/hardware/display/VirtualDisplay.Callback
-            // https://learn.microsoft.com/en-us/dotnet/api/android.hardware.display.virtualdisplay.callback.onpaused?view=net-android-34.0
-            virtualDisplay?.setSurface(null)
-        } else {
-            virtualDisplay?.release()
+        virtualDisplay?.let { display ->
+            if (reuseVirtualDisplay && !releaseVirtualDisplay) {
+                // The virtual display video projection can be paused by calling `setSurface(null)`.
+                // https://developer.android.com/reference/android/hardware/display/VirtualDisplay.Callback
+                // https://learn.microsoft.com/en-us/dotnet/api/android.hardware.display.virtualdisplay.callback.onpaused?view=net-android-34.0
+                runCatching { display.setSurface(null) }
+            } else if (releaseVirtualDisplay) {
+                runCatching { display.release() }
+            }
         }
+        virtualDisplay = null
         // suface needs to be release after `imageReader.close()` to imageReader access released surface
         // https://github.com/rustdesk/rustdesk/issues/4118#issuecomment-1515666629
-        imageReader?.close()
+        runCatching { imageReader?.close() }
         imageReader = null
         videoEncoder?.let {
-            it.signalEndOfInputStream()
-            it.stop()
-            it.release()
-        }
-        if (!reuseVirtualDisplay) {
-            virtualDisplay = null
+            runCatching { it.signalEndOfInputStream() }
+            runCatching { it.stop() }
+            runCatching { it.release() }
         }
         videoEncoder = null
         // suface needs to be release after `imageReader.close()` to imageReader access released surface
         // https://github.com/rustdesk/rustdesk/issues/4118#issuecomment-1515666629
-        surface?.release()
+        runCatching { surface?.release() }
+        surface = null
 
         // release audio
         _isAudioStart = false
         audioRecordHandle.tryReleaseAudio()
+        if (clearMediaProjection) {
+            mediaProjection?.let {
+                runCatching { it.unregisterCallback(mediaProjectionCallback) }
+            }
+            mediaProjectionCallbackRegistered = false
+            mediaProjection = null
+            _isReady = false
+        }
         releaseScreenWakeLock("stop_capture")
     }
 
@@ -575,16 +669,16 @@ class MainService : Service() {
         return isReady
     }
 
-    private fun startRawVideoRecorder(mp: MediaProjection) {
+    private fun startRawVideoRecorder(mp: MediaProjection): Boolean {
         Log.d(logTag, "startRawVideoRecorder,screen info:$SCREEN_INFO")
         if (surface == null) {
             Log.d(logTag, "startRawVideoRecorder failed,surface is null")
-            return
+            return false
         }
-        createOrSetVirtualDisplay(mp, surface!!)
+        return createOrSetVirtualDisplay(mp, surface!!)
     }
 
-    private fun startVP9VideoRecorder(mp: MediaProjection) {
+    private fun startVP9VideoRecorder(mp: MediaProjection): Boolean {
         createMediaCodec()
         videoEncoder?.let {
             surface = it.createInputSurface()
@@ -593,14 +687,19 @@ class MainService : Service() {
             }
             it.setCallback(cb)
             it.start()
-            createOrSetVirtualDisplay(mp, surface!!)
+            return createOrSetVirtualDisplay(mp, surface!!)
         }
+        return false
     }
 
     // https://github.com/bk138/droidVNC-NG/blob/b79af62db5a1c08ed94e6a91464859ffed6f4e97/app/src/main/java/net/christianbeier/droidvnc_ng/MediaProjectionService.java#L250
     // Reuse virtualDisplay if it exists, to avoid media projection confirmation dialog every connection.
-    private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface) {
+    private fun createOrSetVirtualDisplay(mp: MediaProjection, s: Surface): Boolean {
         try {
+            if (virtualDisplay != null && !isStart) {
+                runCatching { virtualDisplay?.release() }
+                virtualDisplay = null
+            }
             virtualDisplay?.let {
                 it.resize(SCREEN_INFO.width, SCREEN_INFO.height, SCREEN_INFO.dpi)
                 it.setSurface(s)
@@ -608,13 +707,15 @@ class MainService : Service() {
                 virtualDisplay = mp.createVirtualDisplay(
                     "RustDeskVD",
                     SCREEN_INFO.width, SCREEN_INFO.height, SCREEN_INFO.dpi, VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    s, null, null
+                    s, virtualDisplayCallback, serviceHandler
                 )
             }
+            return virtualDisplay != null
         } catch (e: SecurityException) {
             Log.w(logTag, "createOrSetVirtualDisplay: got SecurityException, re-requesting confirmation");
             // This initiates a prompt dialog for the user to confirm screen projection.
             requestMediaProjection()
+            return false
         }
     }
 

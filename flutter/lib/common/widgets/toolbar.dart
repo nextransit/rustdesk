@@ -830,14 +830,17 @@ Future<List<TToggleMenu>> toolbarCursor(
         onChanged: (value) async {
           if (value == null) return;
           await bind.sessionToggleOption(sessionId: sessionId, value: option);
-          value = bind.sessionGetToggleOptionSync(
+          final newVal = bind.sessionGetToggleOptionSync(
               sessionId: sessionId, arg: option);
+          if (newVal == null) return;
+          value = newVal;
           showCursorLockState.value = value;
           if (!showCursorEnabled) {
             await bind.sessionToggleOption(
                 sessionId: sessionId, value: showCursorOption);
-            showCursorState.value = bind.sessionGetToggleOptionSync(
+            final v2 = bind.sessionGetToggleOptionSync(
                 sessionId: sessionId, arg: showCursorOption);
+            if (v2 != null) showCursorState.value = v2;
           }
         }));
   }

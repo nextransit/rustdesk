@@ -31,6 +31,7 @@ class MdmControlProvider : ContentProvider() {
                 METHOD_SET_SESSION_PASSWORD -> setSessionPassword(extras)
                 METHOD_CLEAR_SESSION_PASSWORD -> clearSessionPassword()
                 METHOD_START_SERVICE -> startService(extras)
+                METHOD_REQUEST_MEDIA_PROJECTION -> requestMediaProjection()
                 METHOD_STOP_SERVICE -> stopService()
                 METHOD_SERVICE_STATUS -> serviceStatus()
                 METHOD_GET_IDENTITY -> getIdentity()
@@ -78,11 +79,22 @@ class MdmControlProvider : ContentProvider() {
         // Let RustDesk write its own config as the app uid. MDM agent cannot
         // write RustDesk private files directly on non-root devices.
         val appDir = configDir()
-        val ok = FFI.setOption(appDir.absolutePath, "custom-rendezvous-server", hbbs) &&
-            FFI.setOption(appDir.absolutePath, "relay-server", hbbr) &&
-            FFI.setOption(appDir.absolutePath, "key", key)
-        require(ok) { "set RustDesk server options failed" }
+        Log.i(TAG, "MDM-debug setServerConfig start: appDir=${appDir.absolutePath} hbbs=$hbbs hbbr=$hbbr keyLen=${key.length}")
+        val ok1 = FFI.setOption(appDir.absolutePath, "custom-rendezvous-server", hbbs)
+        val after1 = FFI.getLocalOption("custom-rendezvous-server")
+        Log.i(TAG, "MDM-debug FFI.setOption(hbbs)=$ok1 readback=$after1")
+        val ok2 = FFI.setOption(appDir.absolutePath, "relay-server", hbbr)
+        val after2 = FFI.getLocalOption("relay-server")
+        Log.i(TAG, "MDM-debug FFI.setOption(hbbr)=$ok2 readback=$after2")
+        val ok3 = FFI.setOption(appDir.absolutePath, "key", key)
+        val after3 = FFI.getLocalOption("key")
+        Log.i(TAG, "MDM-debug FFI.setOption(key)=$ok3 readbackLen=${after3?.length ?: -1}")
+        val ok = ok1 && ok2 && ok3
+        require(ok) { "set RustDesk server options failed (hbbs=$ok1 hbbr=$ok2 key=$ok3)" }
+        Log.i(TAG, "MDM-debug FFI.startServer called")
         FFI.startServer(appDir.absolutePath, "")
+        val myId = FFI.getMyId(appDir.absolutePath)
+        Log.i(TAG, "MDM-debug FFI.startServer done getMyId=$myId")
         return success(File(appDir, RUSTDESK2_TOML))
     }
 
@@ -148,6 +160,59 @@ class MdmControlProvider : ContentProvider() {
     }
 
     /**
+     * 主动触发 MediaProjection 授权流程.
+     *
+     * start_service 只负责后台驻留和 hbbs/hbbr 监听；远控会话开始时必须显式
+     * 拉起 PermissionRequestTransparentActivity，否则系统投屏授权弹窗不会出现，
+     * MDM Agent 的自动批准 watcher 只能等到超时，最终表现为首帧超时/STREAM_TIMEOUT。
+     */
+    private fun requestMediaProjection(): Bundle {
+        val ctx = context ?: return Bundle().apply {
+            putBoolean(KEY_SUCCESS, false); putString(KEY_ERROR, "no context")
+        }
+        if (MainService.isCapturing) {
+            return Bundle().apply {
+                putBoolean(KEY_SUCCESS, true)
+                putString(KEY_PATH, "MediaProjection already capturing")
+                putBoolean(KEY_STATUS_CAPTURING, true)
+                putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+            }
+        }
+        ctx.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_APP_DIR_CONFIG_PATH, configDir().absolutePath)
+            .apply()
+        return try {
+            val serviceIntent = Intent(ctx, MainService::class.java).apply {
+                action = ACT_START_NO_PROJECTION
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                ctx.startForegroundService(serviceIntent)
+            } else {
+                ctx.startService(serviceIntent)
+            }
+            val intent = Intent(ctx, PermissionRequestTransparentActivity::class.java).apply {
+                action = ACT_REQUEST_MEDIA_PROJECTION
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            ctx.startActivity(intent)
+            Log.i(TAG, "MediaProjection permission request dispatched via MDM provider")
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, true)
+                putString(KEY_PATH, "MediaProjection request dispatched")
+                putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
+                putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "requestMediaProjection failed", e)
+            Bundle().apply {
+                putBoolean(KEY_SUCCESS, false)
+                putString(KEY_ERROR, "requestMediaProjection: ${e.message}")
+            }
+        }
+    }
+
+    /**
      * 关闭 MainService (force-stop 应用).
      *
      * 警告: 这是进程级 force-stop, 不仅停 service, 也清掉整个应用进程.
@@ -196,7 +261,7 @@ class MdmControlProvider : ContentProvider() {
                 putBoolean(KEY_STATUS_RUNNING, mainService != null)
                 putBoolean(KEY_STATUS_FOREGROUND, mainService?.foreground == true)
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
-                putBoolean(KEY_STATUS_CAPTURING, MainService.isStart)
+                putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
                 putBoolean(KEY_STATUS_INPUT_READY, InputService.ctx != null)
             }
         } catch (e: Exception) {
@@ -365,6 +430,7 @@ class MdmControlProvider : ContentProvider() {
         private const val METHOD_SET_SESSION_PASSWORD = "set_session_password"
         private const val METHOD_CLEAR_SESSION_PASSWORD = "clear_session_password"
         private const val METHOD_START_SERVICE = "start_service"
+        private const val METHOD_REQUEST_MEDIA_PROJECTION = "request_media_projection"
         private const val METHOD_STOP_SERVICE = "stop_service"
         private const val METHOD_SERVICE_STATUS = "service_status"
         private const val METHOD_GET_IDENTITY = "get_identity"

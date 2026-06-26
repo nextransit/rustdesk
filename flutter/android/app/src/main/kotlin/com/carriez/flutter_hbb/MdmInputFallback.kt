@@ -2,6 +2,7 @@ package com.carriez.flutter_hbb
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import kotlin.math.max
@@ -13,6 +14,10 @@ object MdmInputFallback {
     private const val KEY_SUCCESS = "success"
 
     fun pointer(context: Context, kind: Int, mask: Int, x: Int, y: Int): Boolean {
+        if (Build.TYPE.equals("user", ignoreCase = true)) {
+            Log.w(TAG, "skip MDM input provider on user build: kind=$kind mask=$mask x=$x y=$y")
+            return false
+        }
         val scaledX = max(0, x) * SCREEN_INFO.scale
         val scaledY = max(0, y) * SCREEN_INFO.scale
         return runCatching {
