@@ -39,6 +39,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import org.json.JSONException
 import org.json.JSONObject
@@ -237,9 +238,23 @@ class MainService : Service() {
     }
 
     companion object {
+        private const val CAPTURE_STATS_LOG_INTERVAL_MS = 5_000L
+        private const val CAPTURE_LOG_TAG = "LOG_SERVICE"
+        private const val MEDIA_PROJECTION_REQUEST_TTL_MS = 12_000L
         private var _isReady = false // media permission ready status
         private var _isStart = false // screen capture start status
         private var _isAudioStart = false // audio capture start status
+        private val captureFrameCount = AtomicLong(0)
+        private val captureByteCount = AtomicLong(0)
+        private val captureDroppedFrameCount = AtomicLong(0)
+        private val captureErrorCount = AtomicLong(0)
+        @Volatile private var captureStartedAtMs = 0L
+        @Volatile private var captureLastFrameAtMs = 0L
+        @Volatile private var captureLastStatsLogAtMs = 0L
+        @Volatile private var captureLastStatsLogFrameCount = 0L
+        @Volatile private var captureLastStatsLogByteCount = 0L
+        @Volatile private var captureLastError: String? = null
+        @Volatile private var mediaProjectionRequestStartedAtMs = 0L
         val isReady: Boolean
             get() = _isReady
         val isStart: Boolean
@@ -248,17 +263,140 @@ class MainService : Service() {
             get() = _isReady && _isStart
         val isAudioStart: Boolean
             get() = _isAudioStart
+
+        val captureFrames: Long
+            get() = captureFrameCount.get()
+        val captureBytes: Long
+            get() = captureByteCount.get()
+        val captureDroppedFrames: Long
+            get() = captureDroppedFrameCount.get()
+        val captureErrors: Long
+            get() = captureErrorCount.get()
+        val captureStartedAt: Long
+            get() = captureStartedAtMs
+        val captureLastFrameAt: Long
+            get() = captureLastFrameAtMs
+        val captureLastFrameAgeMs: Long
+            get() = captureLastFrameAtMs.takeIf { it > 0L }?.let {
+                (System.currentTimeMillis() - it).coerceAtLeast(0L)
+            } ?: -1L
+        val captureDurationMs: Long
+            get() = captureStartedAtMs.takeIf { it > 0L }?.let {
+                (System.currentTimeMillis() - it).coerceAtLeast(0L)
+            } ?: 0L
+        val captureAverageFps: Double
+            get() {
+                val durationMs = captureDurationMs
+                return if (durationMs > 0L) captureFrameCount.get() * 1000.0 / durationMs else 0.0
+            }
+        val captureLastErrorMessage: String?
+            get() = captureLastError
+        val mediaProjectionRequestInFlight: Boolean
+            get() {
+                val startedAt = mediaProjectionRequestStartedAtMs
+                val ageMs = System.currentTimeMillis() - startedAt
+                return startedAt > 0L && ageMs in 0L..MEDIA_PROJECTION_REQUEST_TTL_MS
+            }
+
+        fun markMediaProjectionRequestStarted(reason: String) {
+            mediaProjectionRequestStartedAtMs = System.currentTimeMillis()
+            Log.i(CAPTURE_LOG_TAG, "MDM-MediaProjectionRequest state=started reason=$reason")
+        }
+
+        fun clearMediaProjectionRequest(reason: String) {
+            if (mediaProjectionRequestStartedAtMs > 0L) {
+                Log.i(CAPTURE_LOG_TAG, "MDM-MediaProjectionRequest state=cleared reason=$reason")
+            }
+            mediaProjectionRequestStartedAtMs = 0L
+        }
+
+        fun resetCaptureStats() {
+            val now = System.currentTimeMillis()
+            captureFrameCount.set(0)
+            captureByteCount.set(0)
+            captureDroppedFrameCount.set(0)
+            captureErrorCount.set(0)
+            captureStartedAtMs = now
+            captureLastFrameAtMs = 0L
+            captureLastStatsLogAtMs = now
+            captureLastStatsLogFrameCount = 0L
+            captureLastStatsLogByteCount = 0L
+            captureLastError = null
+            Log.i(
+                CAPTURE_LOG_TAG,
+                "MDM-CaptureStart width=${SCREEN_INFO.width} height=${SCREEN_INFO.height} " +
+                    "scale=${SCREEN_INFO.scale} dpi=${SCREEN_INFO.dpi}"
+            )
+        }
+
+        fun recordCaptureFrame(byteCount: Int) {
+            val now = System.currentTimeMillis()
+            val frames = captureFrameCount.incrementAndGet()
+            val bytes = captureByteCount.addAndGet(byteCount.toLong().coerceAtLeast(0L))
+            captureLastFrameAtMs = now
+            if (now - captureLastStatsLogAtMs >= CAPTURE_STATS_LOG_INTERVAL_MS) {
+                val lastLogAt = captureLastStatsLogAtMs
+                val deltaMs = (now - lastLogAt).coerceAtLeast(1L)
+                val deltaFrames = frames - captureLastStatsLogFrameCount
+                val deltaBytes = bytes - captureLastStatsLogByteCount
+                captureLastStatsLogAtMs = now
+                captureLastStatsLogFrameCount = frames
+                captureLastStatsLogByteCount = bytes
+                Log.i(
+                    CAPTURE_LOG_TAG,
+                    "MDM-CaptureStats active=$isCapturing frames=$frames delta_frames=$deltaFrames " +
+                        "bytes=$bytes delta_bytes=$deltaBytes window_fps=${deltaFrames * 1000.0 / deltaMs} " +
+                        "avg_fps=$captureAverageFps last_frame_age_ms=$captureLastFrameAgeMs " +
+                        "dropped=${captureDroppedFrameCount.get()} errors=${captureErrorCount.get()} " +
+                        "width=${SCREEN_INFO.width} height=${SCREEN_INFO.height} scale=${SCREEN_INFO.scale}"
+                )
+            }
+        }
+
+        fun recordCaptureDroppedFrame(reason: String) {
+            val dropped = captureDroppedFrameCount.incrementAndGet()
+            if (dropped <= 3 || dropped % 30 == 0L) {
+                Log.w(CAPTURE_LOG_TAG, "MDM-CaptureDrop reason=$reason dropped=$dropped active=$isCapturing")
+            }
+        }
+
+        fun recordCaptureError(e: Exception) {
+            val errors = captureErrorCount.incrementAndGet()
+            captureLastError = "${e.javaClass.simpleName}: ${e.message ?: "no message"}"
+            Log.w(CAPTURE_LOG_TAG, "MDM-CaptureFrameError errors=$errors last_error=$captureLastError", e)
+        }
+
+        fun logCaptureStop(reason: String, activeBeforeStop: Boolean) {
+            Log.i(
+                CAPTURE_LOG_TAG,
+                "MDM-CaptureStop reason=$reason active_before_stop=$activeBeforeStop " +
+                    "frames=${captureFrameCount.get()} bytes=${captureByteCount.get()} " +
+                    "duration_ms=$captureDurationMs last_frame_age_ms=$captureLastFrameAgeMs " +
+                    "dropped=${captureDroppedFrameCount.get()} errors=${captureErrorCount.get()} " +
+                    "last_error=${captureLastError ?: ""}"
+            )
+        }
     }
 
     private val logTag = "LOG_SERVICE"
-    private val mediaProjectionCallback = object : MediaProjection.Callback() {
+    private fun newMediaProjectionCallback(projection: MediaProjection) = object : MediaProjection.Callback() {
         override fun onStop() {
-            Log.w(logTag, "MediaProjection callback onStop")
-            markCaptureInactive(
-                reason = "media_projection_on_stop",
-                clearMediaProjection = true,
-                releaseVirtualDisplay = false
-            )
+            synchronized(this@MainService) {
+                if (mediaProjection !== projection) {
+                    Log.w(logTag, "MediaProjection callback onStop ignored for stale projection")
+                    return
+                }
+                Log.w(
+                    logTag,
+                    "MediaProjection callback onStop active=$isStart frames=$captureFrames " +
+                        "bytes=$captureBytes last_frame_age_ms=$captureLastFrameAgeMs"
+                )
+                markCaptureInactive(
+                    reason = "media_projection_on_stop",
+                    clearMediaProjection = true,
+                    releaseVirtualDisplay = true
+                )
+            }
         }
     }
     private val virtualDisplayCallback = object : VirtualDisplay.Callback() {
@@ -280,7 +418,7 @@ class MainService : Service() {
             markCaptureInactive(
                 reason = "virtual_display_stopped",
                 clearMediaProjection = false,
-                releaseVirtualDisplay = false
+                releaseVirtualDisplay = true
             )
         }
     }
@@ -296,7 +434,7 @@ class MainService : Service() {
     private var videoEncoder: MediaCodec? = null
     private var imageReader: ImageReader? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var mediaProjectionCallbackRegistered = false
+    private var mediaProjectionCallback: MediaProjection.Callback? = null
 
     // audio
     private val audioRecordHandle = AudioRecordHandle(this, { isStart }, { isAudioStart })
@@ -411,43 +549,75 @@ class MainService : Service() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACT_INIT_MEDIA_PROJECTION_AND_SERVICE -> {
-            createForegroundNotification()
+                createForegroundNotification()
 
-            if (intent.getBooleanExtra(EXT_INIT_FROM_BOOT, false)) {
-                FFI.startService(appFlutterDir())
-            }
-            Log.d(logTag, "service starting: ${startId}:${Thread.currentThread()}")
-            val mediaProjectionManager =
-                getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                if (intent.getBooleanExtra(EXT_INIT_FROM_BOOT, false)) {
+                    FFI.startService(appFlutterDir())
+                }
+                Log.d(logTag, "service starting: ${startId}:${Thread.currentThread()}")
+                val mediaProjectionManager =
+                    getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-            intent.getParcelableExtra<Intent>(EXT_MEDIA_PROJECTION_RES_INTENT)?.let {
-                if (virtualDisplay != null || isStart) {
-                    markCaptureInactive(
-                        reason = "new_media_projection",
-                        clearMediaProjection = false,
-                        releaseVirtualDisplay = true
-                    )
+                val projectionIntent = intent.getParcelableExtra<Intent>(EXT_MEDIA_PROJECTION_RES_INTENT)
+                if (projectionIntent == null) {
+                    Log.d(logTag, "getParcelableExtra intent null, invoke requestMediaProjection")
+                    requestMediaProjection()
+                } else {
+                    try {
+                        if (virtualDisplay != null || isStart) {
+                            markCaptureInactive(
+                                reason = "new_media_projection",
+                                clearMediaProjection = false,
+                                releaseVirtualDisplay = true
+                            )
+                        }
+                        val previousProjection = mediaProjection
+                        val previousCallback = mediaProjectionCallback
+                        if (previousProjection != null && previousCallback != null) {
+                            runCatching { previousProjection.unregisterCallback(previousCallback) }
+                        }
+                        if (previousProjection != null) {
+                            Log.d(logTag, "Stopping previous MediaProjection before replacing it")
+                            runCatching { previousProjection.stop() }
+                                .onFailure { Log.w(logTag, "Previous MediaProjection stop failed", it) }
+                            mediaProjection = null
+                            mediaProjectionCallback = null
+                            _isReady = false
+                        }
+
+                        val projection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, projectionIntent)
+                        if (projection == null) {
+                            _isReady = false
+                            clearMediaProjectionRequest("projection_null")
+                            recordCaptureError(IllegalStateException("MediaProjectionManager returned null projection"))
+                            return START_NOT_STICKY
+                        }
+
+                        val callback = newMediaProjectionCallback(projection)
+                        mediaProjection = projection
+                        mediaProjectionCallback = callback
+                        projection.registerCallback(
+                            callback,
+                            serviceHandler ?: Handler(Looper.getMainLooper())
+                        )
+                        checkMediaPermission()
+                        _isReady = true
+                        clearMediaProjectionRequest("projection_ready")
+                        Log.d(logTag, "MediaProjection ready, starting capture")
+                        if (!startCapture(projection)) {
+                            Log.w(logTag, "MediaProjection ready but startCapture failed")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(logTag, "MediaProjection init failed", e)
+                        recordCaptureError(e)
+                        clearMediaProjectionRequest("projection_exception")
+                        markCaptureInactive(
+                            reason = "media_projection_init_exception",
+                            clearMediaProjection = true,
+                            releaseVirtualDisplay = true
+                        )
+                    }
                 }
-                mediaProjection?.let { existing ->
-                    runCatching { existing.unregisterCallback(mediaProjectionCallback) }
-                    mediaProjectionCallbackRegistered = false
-                }
-                mediaProjection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, it)
-                mediaProjection?.registerCallback(
-                    mediaProjectionCallback,
-                    serviceHandler ?: Handler(Looper.getMainLooper())
-                )
-                mediaProjectionCallbackRegistered = true
-                checkMediaPermission()
-                _isReady = true
-                Log.d(logTag, "MediaProjection ready, starting capture")
-                if (!startCapture()) {
-                    Log.w(logTag, "MediaProjection ready but startCapture failed")
-                }
-            } ?: let {
-                Log.d(logTag, "getParcelableExtra intent null, invoke requestMediaProjection")
-                requestMediaProjection()
-            }
             }
             // mdm-no-launcher 模式: mdm-agent 拉起 service 进入后台驻留,
             // 不需要 mediaProjection 也不弹任何 UI, 仅启动 FFI 让 rust 端
@@ -472,11 +642,21 @@ class MainService : Service() {
     }
 
     private fun requestMediaProjection() {
+        if (mediaProjectionRequestInFlight) {
+            Log.d(logTag, "MediaProjection request already in flight")
+            return
+        }
+        markMediaProjectionRequestStarted("main_service")
         val intent = Intent(this, PermissionRequestTransparentActivity::class.java).apply {
             action = ACT_REQUEST_MEDIA_PROJECTION
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
         }
-        startActivity(intent)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            clearMediaProjectionRequest("main_service_start_failed")
+            throw e
+        }
     }
 
     @SuppressLint("WrongConstant")
@@ -497,13 +677,23 @@ class MainService : Service() {
                         try {
                             // If not call acquireLatestImage, listener will not be called again
                             imageReader.acquireLatestImage().use { image ->
-                                if (image == null || !isStart) return@setOnImageAvailableListener
+                                if (image == null) {
+                                    recordCaptureDroppedFrame("null_image")
+                                    return@setOnImageAvailableListener
+                                }
+                                if (!isStart) {
+                                    recordCaptureDroppedFrame("capture_not_started")
+                                    return@setOnImageAvailableListener
+                                }
                                 val planes = image.planes
                                 val buffer = planes[0].buffer
                                 buffer.rewind()
+                                val byteCount = buffer.remaining()
                                 FFI.onVideoFrameUpdate(buffer)
+                                recordCaptureFrame(byteCount)
                             }
-                        } catch (ignored: java.lang.Exception) {
+                        } catch (e: java.lang.Exception) {
+                            recordCaptureError(e)
                         }
                     }, serviceHandler)
                 }
@@ -520,11 +710,13 @@ class MainService : Service() {
         return audioRecordHandle.onVoiceCallClosed(mediaProjection)
     }
 
-    fun startCapture(): Boolean {
+    @Synchronized
+    fun startCapture(projection: MediaProjection? = mediaProjection): Boolean {
         if (isStart) {
             return isReady
         }
-        if (mediaProjection == null) {
+        val activeProjection = projection
+        if (activeProjection == null) {
             Log.w(logTag, "startCapture fail,mediaProjection is null")
             return false
         }
@@ -544,12 +736,13 @@ class MainService : Service() {
         }
 
         _isStart = true
+        resetCaptureStats()
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
 
         val recorderStarted = if (useVP9) {
-            startVP9VideoRecorder(mediaProjection!!)
+            startVP9VideoRecorder(activeProjection)
         } else {
-            startRawVideoRecorder(mediaProjection!!)
+            startRawVideoRecorder(activeProjection)
         }
         if (!recorderStarted || !isStart) {
             Log.w(logTag, "startCapture failed or capture stopped immediately: recorderStarted=$recorderStarted isStart=$isStart")
@@ -562,7 +755,7 @@ class MainService : Service() {
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!audioRecordHandle.createAudioRecorder(false, mediaProjection)) {
+            if (!audioRecordHandle.createAudioRecorder(false, activeProjection)) {
                 Log.d(logTag, "createAudioRecorder fail")
             } else {
                 Log.d(logTag, "audio recorder start")
@@ -590,17 +783,25 @@ class MainService : Service() {
         releaseVirtualDisplay: Boolean
     ) {
         Log.d(logTag, "Stop Capture reason=$reason clearMediaProjection=$clearMediaProjection releaseVirtualDisplay=$releaseVirtualDisplay")
+        logCaptureStop(reason, _isStart)
         FFI.setFrameRawEnable("video",false)
         _isStart = false
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         // release video
         virtualDisplay?.let { display ->
-            if (reuseVirtualDisplay && !releaseVirtualDisplay) {
+            val shouldReleaseVirtualDisplay = releaseVirtualDisplay || !reuseVirtualDisplay
+            if (reuseVirtualDisplay && !shouldReleaseVirtualDisplay) {
                 // The virtual display video projection can be paused by calling `setSurface(null)`.
                 // https://developer.android.com/reference/android/hardware/display/VirtualDisplay.Callback
                 // https://learn.microsoft.com/en-us/dotnet/api/android.hardware.display.virtualdisplay.callback.onpaused?view=net-android-34.0
+                Log.d(logTag, "Pause VirtualDisplay via setSurface(null) reason=$reason")
                 runCatching { display.setSurface(null) }
-            } else if (releaseVirtualDisplay) {
+            } else if (shouldReleaseVirtualDisplay) {
+                Log.d(
+                    logTag,
+                    "Release VirtualDisplay reason=$reason requested=$releaseVirtualDisplay " +
+                        "reuseVirtualDisplay=$reuseVirtualDisplay"
+                )
                 runCatching { display.release() }
             }
         }
@@ -624,10 +825,13 @@ class MainService : Service() {
         _isAudioStart = false
         audioRecordHandle.tryReleaseAudio()
         if (clearMediaProjection) {
-            mediaProjection?.let {
-                runCatching { it.unregisterCallback(mediaProjectionCallback) }
+            val callback = mediaProjectionCallback
+            mediaProjection?.let { projection ->
+                if (callback != null) {
+                    runCatching { projection.unregisterCallback(callback) }
+                }
             }
-            mediaProjectionCallbackRegistered = false
+            mediaProjectionCallback = null
             mediaProjection = null
             _isReady = false
         }
@@ -646,6 +850,13 @@ class MainService : Service() {
             virtualDisplay = null
         }
 
+        val callback = mediaProjectionCallback
+        mediaProjection?.let { projection ->
+            if (callback != null) {
+                runCatching { projection.unregisterCallback(callback) }
+            }
+        }
+        mediaProjectionCallback = null
         mediaProjection = null
         checkMediaPermission()
         stopForeground(true)

@@ -41,9 +41,11 @@ class PermissionRequestTransparentActivity: Activity() {
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val requestIntent = mediaProjectionManager.createScreenCaptureIntent()
             Log.d(logTag, "Starting MediaProjection permission request")
+            MainService.markMediaProjectionRequestStarted("permission_activity")
             startActivityForResult(requestIntent, REQ_REQUEST_MEDIA_PROJECTION)
         } catch (e: Exception) {
             Log.e(logTag, "Failed to start MediaProjection permission request", e)
+            MainService.clearMediaProjectionRequest("permission_activity_start_failed")
             setResult(RES_FAILED)
             finish()
         }
@@ -56,6 +58,7 @@ class PermissionRequestTransparentActivity: Activity() {
             if (resultCode == RESULT_OK && data != null) {
                 launchService(data)
             } else {
+                MainService.clearMediaProjectionRequest("permission_denied_or_empty")
                 setResult(RES_FAILED)
             }
         }
@@ -69,10 +72,15 @@ class PermissionRequestTransparentActivity: Activity() {
         serviceIntent.action = ACT_INIT_MEDIA_PROJECTION_AND_SERVICE
         serviceIntent.putExtra(EXT_MEDIA_PROJECTION_RES_INTENT, mediaProjectionResultIntent)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+        } catch (e: Exception) {
+            MainService.clearMediaProjectionRequest("launch_service_failed")
+            throw e
         }
     }
 

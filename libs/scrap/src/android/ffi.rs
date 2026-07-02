@@ -15,7 +15,6 @@ use lazy_static::lazy_static;
 use serde::Deserialize;
 use std::ops::Not;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering::SeqCst};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -34,73 +33,152 @@ lazy_static! {
 
 const MAX_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_AUDIO_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
+const RAW_FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(750);
 
 struct FrameRaw {
     name: &'static str,
-    ptr: AtomicPtr<u8>,
-    len: usize,
+    data: Vec<u8>,
     last_update: Instant,
     timeout: Duration,
     enable: bool,
+    update_count: u64,
+    take_count: u64,
+    duplicate_skip_count: u64,
+    duplicate_force_count: u64,
+    timeout_count: u64,
+    disabled_drop_count: u64,
+    empty_take_count: u64,
+    last_stats_log: Instant,
+    last_forced_duplicate: Instant,
 }
 
 impl FrameRaw {
     fn new(name: &'static str, timeout: Duration) -> Self {
+        let now = Instant::now();
         FrameRaw {
             name,
-            ptr: AtomicPtr::default(),
-            len: 0,
-            last_update: Instant::now(),
+            data: Vec::new(),
+            last_update: now,
             timeout,
             enable: false,
+            update_count: 0,
+            take_count: 0,
+            duplicate_skip_count: 0,
+            duplicate_force_count: 0,
+            timeout_count: 0,
+            disabled_drop_count: 0,
+            empty_take_count: 0,
+            last_stats_log: now,
+            last_forced_duplicate: now,
         }
     }
 
     fn set_enable(&mut self, value: bool) {
+        let now = Instant::now();
         self.enable = value;
-        self.ptr.store(std::ptr::null_mut(), SeqCst);
-        self.len = 0;
+        self.data.clear();
+        self.last_update = now;
+        self.update_count = 0;
+        self.take_count = 0;
+        self.duplicate_skip_count = 0;
+        self.duplicate_force_count = 0;
+        self.timeout_count = 0;
+        self.disabled_drop_count = 0;
+        self.empty_take_count = 0;
+        self.last_stats_log = now;
+        self.last_forced_duplicate = now;
+        log::info!("MDM-RawFrameEnable name={} enabled={}", self.name, value);
     }
 
     fn update(&mut self, data: *mut u8, len: usize) {
+        let now = Instant::now();
         if self.enable.not() {
+            self.disabled_drop_count += 1;
+            self.maybe_log_stats(now);
             return;
         }
-        self.len = len;
-        self.ptr.store(data, SeqCst);
-        self.last_update = Instant::now();
+        if data.is_null() || len == 0 {
+            return;
+        }
+        self.data.resize(len, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data as *const u8, self.data.as_mut_ptr(), len);
+        }
+        self.last_update = now;
+        self.update_count += 1;
+        self.maybe_log_stats(now);
     }
 
     // take inner data as slice
     // release when success
     fn take<'a>(&mut self, dst: &mut Vec<u8>, last: &mut Vec<u8>) -> Option<()> {
+        let now = Instant::now();
         if self.enable.not() {
             return None;
         }
-        let ptr = self.ptr.load(SeqCst);
-        if ptr.is_null() || self.len == 0 {
-            None
-        } else {
-            if self.last_update.elapsed() > self.timeout {
-                log::trace!("Failed to take {} raw,timeout!", self.name);
-                return None;
-            }
-            let slice = unsafe { std::slice::from_raw_parts(ptr, self.len) };
-            self.release();
-            if last.len() == slice.len() && crate::would_block_if_equal(last, slice).is_err() {
-                return None;
-            }
-            dst.resize(slice.len(), 0);
-            unsafe {
-                std::ptr::copy_nonoverlapping(slice.as_ptr(), dst.as_mut_ptr(), slice.len());
-            }
-            Some(())
+        if self.data.is_empty() {
+            self.empty_take_count += 1;
+            self.maybe_log_stats(now);
+            return None;
         }
+        if self.name != "video" && self.last_update.elapsed() > self.timeout {
+            self.timeout_count += 1;
+            log::trace!("Failed to take {} raw,timeout!", self.name);
+            self.release();
+            self.maybe_log_stats(now);
+            return None;
+        }
+        let duplicate = last.len() == self.data.len() && last.as_slice() == self.data.as_slice();
+        if duplicate {
+            self.duplicate_skip_count += 1;
+            let force_duplicate = self.name == "video"
+                && self.last_forced_duplicate.elapsed() >= FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL;
+            if !force_duplicate {
+                self.release();
+                self.maybe_log_stats(now);
+                return None;
+            }
+            self.duplicate_force_count += 1;
+            self.last_forced_duplicate = now;
+        } else {
+            last.resize(self.data.len(), 0);
+            last.copy_from_slice(&self.data);
+            self.last_forced_duplicate = now;
+        }
+        dst.resize(self.data.len(), 0);
+        dst.copy_from_slice(&self.data);
+        self.take_count += 1;
+        self.release();
+        self.maybe_log_stats(now);
+        Some(())
     }
 
     fn release(&mut self) {
-        self.len = 0;
-        self.ptr.store(std::ptr::null_mut(), SeqCst);
+        if self.name != "video" {
+            self.data.clear();
+        }
+    }
+
+    fn maybe_log_stats(&mut self, now: Instant) {
+        if now.duration_since(self.last_stats_log) < RAW_FRAME_STATS_LOG_INTERVAL {
+            return;
+        }
+        self.last_stats_log = now;
+        log::info!(
+            "MDM-RawFrameStats name={} enabled={} updates={} takes={} duplicate_skips={} duplicate_forces={} timeouts={} disabled_drops={} empty_takes={} buffered_len={} last_update_age_ms={}",
+            self.name,
+            self.enable,
+            self.update_count,
+            self.take_count,
+            self.duplicate_skip_count,
+            self.duplicate_force_count,
+            self.timeout_count,
+            self.disabled_drop_count,
+            self.empty_take_count,
+            self.data.len(),
+            self.last_update.elapsed().as_millis(),
+        );
     }
 }
 

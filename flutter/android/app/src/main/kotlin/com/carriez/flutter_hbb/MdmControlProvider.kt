@@ -178,6 +178,14 @@ class MdmControlProvider : ContentProvider() {
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
             }
         }
+        if (MainService.mediaProjectionRequestInFlight) {
+            return Bundle().apply {
+                putBoolean(KEY_SUCCESS, true)
+                putString(KEY_PATH, "MediaProjection request already in flight")
+                putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
+                putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+            }
+        }
         ctx.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_APP_DIR_CONFIG_PATH, configDir().absolutePath)
@@ -195,6 +203,7 @@ class MdmControlProvider : ContentProvider() {
                 action = ACT_REQUEST_MEDIA_PROJECTION
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
+            MainService.markMediaProjectionRequestStarted("mdm_provider")
             ctx.startActivity(intent)
             Log.i(TAG, "MediaProjection permission request dispatched via MDM provider")
             Bundle().apply {
@@ -204,6 +213,7 @@ class MdmControlProvider : ContentProvider() {
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
             }
         } catch (e: Exception) {
+            MainService.clearMediaProjectionRequest("mdm_provider_failed")
             Log.e(TAG, "requestMediaProjection failed", e)
             Bundle().apply {
                 putBoolean(KEY_SUCCESS, false)
@@ -262,7 +272,23 @@ class MdmControlProvider : ContentProvider() {
                 putBoolean(KEY_STATUS_FOREGROUND, mainService?.foreground == true)
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
                 putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
-                putBoolean(KEY_STATUS_INPUT_READY, InputService.ctx != null)
+                putBoolean(KEY_STATUS_INPUT_READY, InputService.ctx != null || MdmInputFallback.isAvailable(ctx))
+                putLong(KEY_STATUS_CAPTURE_FRAMES, MainService.captureFrames)
+                putLong(KEY_STATUS_CAPTURE_BYTES, MainService.captureBytes)
+                putLong(KEY_STATUS_CAPTURE_DROPPED_FRAMES, MainService.captureDroppedFrames)
+                putLong(KEY_STATUS_CAPTURE_ERRORS, MainService.captureErrors)
+                putLong(KEY_STATUS_CAPTURE_STARTED_AT, MainService.captureStartedAt)
+                putLong(KEY_STATUS_CAPTURE_LAST_FRAME_AT, MainService.captureLastFrameAt)
+                putLong(KEY_STATUS_CAPTURE_LAST_FRAME_AGE_MS, MainService.captureLastFrameAgeMs)
+                putLong(KEY_STATUS_CAPTURE_DURATION_MS, MainService.captureDurationMs)
+                putDouble(KEY_STATUS_CAPTURE_AVG_FPS, MainService.captureAverageFps)
+                putInt(KEY_STATUS_CAPTURE_WIDTH, SCREEN_INFO.width)
+                putInt(KEY_STATUS_CAPTURE_HEIGHT, SCREEN_INFO.height)
+                putInt(KEY_STATUS_CAPTURE_SCALE, SCREEN_INFO.scale)
+                putInt(KEY_STATUS_CAPTURE_DPI, SCREEN_INFO.dpi)
+                MainService.captureLastErrorMessage?.let {
+                    putString(KEY_STATUS_CAPTURE_LAST_ERROR, it)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "serviceStatus failed", e)
@@ -449,6 +475,20 @@ class MdmControlProvider : ContentProvider() {
         private const val KEY_STATUS_MEDIA_READY = "media_ready"
         private const val KEY_STATUS_CAPTURING = "capturing"
         private const val KEY_STATUS_INPUT_READY = "input_ready"
+        private const val KEY_STATUS_CAPTURE_FRAMES = "capture_frames"
+        private const val KEY_STATUS_CAPTURE_BYTES = "capture_bytes"
+        private const val KEY_STATUS_CAPTURE_DROPPED_FRAMES = "capture_dropped_frames"
+        private const val KEY_STATUS_CAPTURE_ERRORS = "capture_errors"
+        private const val KEY_STATUS_CAPTURE_STARTED_AT = "capture_started_at"
+        private const val KEY_STATUS_CAPTURE_LAST_FRAME_AT = "capture_last_frame_at"
+        private const val KEY_STATUS_CAPTURE_LAST_FRAME_AGE_MS = "capture_last_frame_age_ms"
+        private const val KEY_STATUS_CAPTURE_DURATION_MS = "capture_duration_ms"
+        private const val KEY_STATUS_CAPTURE_AVG_FPS = "capture_avg_fps"
+        private const val KEY_STATUS_CAPTURE_WIDTH = "capture_width"
+        private const val KEY_STATUS_CAPTURE_HEIGHT = "capture_height"
+        private const val KEY_STATUS_CAPTURE_SCALE = "capture_scale"
+        private const val KEY_STATUS_CAPTURE_DPI = "capture_dpi"
+        private const val KEY_STATUS_CAPTURE_LAST_ERROR = "capture_last_error"
         private const val KEY_RUSTDESK_ID = "rustdesk_id"
 
         // mdm-agent 拉起 service 的 action (无 mediaProjection, 用于纯后台驻留)

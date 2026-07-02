@@ -8,6 +8,7 @@ package com.carriez.flutter_hbb
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Context
 import android.graphics.Path
 import android.os.Build
 import android.os.Bundle
@@ -283,6 +284,11 @@ class InputService : AccessibilityService() {
         if (now - lastMediaProjectionAutoApproveAt < 500L) {
             return
         }
+        if (!isMediaProjectionAutoApproveAllowed()) {
+            lastMediaProjectionAutoApproveAt = now
+            Log.i(logTag, "MediaProjection prompt auto-approve skipped: disabled")
+            return
+        }
 
         val roots = mutableListOf<AccessibilityNodeInfo>()
         rootInActiveWindow?.let { roots += it }
@@ -300,6 +306,12 @@ class InputService : AccessibilityService() {
         val clicked = clickNodeOrClickableParent(target)
         lastMediaProjectionAutoApproveAt = now
         Log.i(logTag, "MediaProjection prompt auto-approved by accessibility: clicked=$clicked text=${target.text}")
+    }
+
+    private fun isMediaProjectionAutoApproveAllowed(): Boolean {
+        return applicationContext
+            .getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
+            .getBoolean(KEY_ALLOW_MEDIA_PROJECTION_AUTO_APPROVE, false)
     }
 
     private fun containsMediaProjectionPrompt(node: AccessibilityNodeInfo?): Boolean {
