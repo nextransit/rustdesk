@@ -9,6 +9,27 @@ use std::{
 
 use uuid::Uuid;
 
+#[cfg(target_os = "android")]
+use std::ffi::CString;
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_print(prio: i32, tag: *const i8, fmt: *const i8, ...) -> i32;
+}
+#[cfg(target_os = "android")]
+#[inline]
+fn android_log(tag: &str, msg: &str) {
+    if let (Ok(tag_c), Ok(msg_c)) = (CString::new(tag), CString::new(msg)) {
+        unsafe {
+            __android_log_print(
+                4,
+                tag_c.as_ptr() as *const i8,
+                msg_c.as_ptr() as *const i8,
+            );
+        }
+    }
+}
+
+
 use hbb_common::{
     allow_err,
     anyhow::{self, bail},
@@ -484,6 +505,8 @@ impl RendezvousMediator {
 
     async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
         let addr = AddrMangle::decode(&rr.socket_addr);
+        #[cfg(target_os = "android")]
+        android_log("rustdesk_conn", &format!("handle_request_relay relay_server={} uuid={} secure={}", rr.relay_server, rr.uuid, rr.secure));
         let last = *LAST_RELAY_MSG.lock().await;
         *LAST_RELAY_MSG.lock().await = (addr, Instant::now());
         // skip duplicate relay request messages

@@ -24,6 +24,7 @@ import com.hjq.permissions.Permission
 import com.hjq.permissions.XXPermissions
 import ffi.FFI
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.*
 
 
@@ -67,7 +68,7 @@ data class Info(
 
 fun isSupportVoiceCall(): Boolean {
     // https://developer.android.com/reference/android/media/MediaRecorder.AudioSource#VOICE_COMMUNICATION
-    return Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+    return Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
 }
 
 fun requestPermission(context: Context, type: String) {
@@ -99,19 +100,36 @@ fun startAction(context: Context, action: String) {
     }
 }
 
-class AudioReader(val bufSize: Int, private val maxFrames: Int) {
+class AudioReader(
+    private val readBufSize: Int,
+    private val bytesPerSample: Int,
+    private val inputChannels: Int,
+    private val outputChannels: Int,
+    private val maxFrames: Int
+) {
     private var currentPos = 0
-    private val bufferPool: Array<ByteBuffer>
+    private val inputBufferPool: Array<ByteBuffer>
+    private val outputBufferPool: Array<ByteBuffer>
+    private val outputBufSize: Int
 
     init {
         if (maxFrames < 0 || maxFrames > 32) {
             throw Exception("Out of bounds")
         }
-        if (bufSize <= 0) {
+        if (readBufSize <= 0 || bytesPerSample <= 0 || inputChannels <= 0 || outputChannels <= 0) {
             throw Exception("Wrong bufSize")
         }
-        bufferPool = Array(maxFrames) {
-            ByteBuffer.allocateDirect(bufSize)
+        val inputFrames = readBufSize / (bytesPerSample * inputChannels)
+        outputBufSize = inputFrames * outputChannels * bytesPerSample
+        inputBufferPool = Array(maxFrames) {
+            ByteBuffer.allocateDirect(readBufSize).order(ByteOrder.nativeOrder())
+        }
+        outputBufferPool = if (inputChannels == outputChannels) {
+            inputBufferPool
+        } else {
+            Array(maxFrames) {
+                ByteBuffer.allocateDirect(outputBufSize).order(ByteOrder.nativeOrder())
+            }
         }
     }
 
@@ -124,9 +142,28 @@ class AudioReader(val bufSize: Int, private val maxFrames: Int) {
 
     @RequiresApi(Build.VERSION_CODES.M)
     fun readSync(audioRecord: AudioRecord): ByteBuffer? {
-        val buffer = bufferPool[currentPos]
-        val res = audioRecord.read(buffer, bufSize, READ_BLOCKING)
-        return if (res > 0) {
+        val inputBuffer = inputBufferPool[currentPos]
+        inputBuffer.clear()
+        val res = audioRecord.read(inputBuffer, readBufSize, READ_BLOCKING)
+        if (res != readBufSize) {
+            return null
+        }
+        inputBuffer.rewind()
+        val buffer = if (inputChannels == outputChannels) {
+            inputBuffer
+        } else {
+            val outputBuffer = outputBufferPool[currentPos]
+            outputBuffer.clear()
+            while (inputBuffer.remaining() >= bytesPerSample) {
+                val sample = inputBuffer.getFloat()
+                repeat(outputChannels) {
+                    outputBuffer.putFloat(sample)
+                }
+            }
+            outputBuffer.rewind()
+            outputBuffer
+        }
+        return if (buffer.capacity() == outputBufSize) {
             next()
             buffer
         } else {

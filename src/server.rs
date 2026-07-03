@@ -165,6 +165,8 @@ async fn accept_connection_(
     secure: bool,
     control_permissions: Option<ControlPermissions>,
 ) -> ResultType<()> {
+    #[cfg(target_os = "android")]
+    android_log("rustdesk_conn", &format!("accept_connection_ entered secure={}", secure));
     let local_addr = socket.local_addr();
     drop(socket);
     // even we drop socket, below still may fail if not use reuse_addr,
@@ -260,6 +262,8 @@ pub async fn create_tcp_connection(
         }
         log::info!("wake up macos");
     }
+    #[cfg(target_os = "android")]
+    android_log("rustdesk_conn", &format!("accept_connection calling Connection::start id={} addr={} secure={}", id, addr, secure));
     Connection::start(
         addr,
         stream,
@@ -292,6 +296,8 @@ pub async fn create_relay_connection(
     ipv4: bool,
     control_permissions: Option<ControlPermissions>,
 ) {
+    #[cfg(target_os = "android")]
+    android_log("rustdesk_conn", &format!("create_relay_connection peer={} relay={} uuid={}", peer_addr, relay_server, uuid));
     if let Err(err) = create_relay_connection_(
         server,
         relay_server,
@@ -336,6 +342,27 @@ async fn create_relay_connection_(
     stream.send(&msg_out).await?;
     create_tcp_connection(server, stream, peer_addr, secure, control_permissions).await?;
     Ok(())
+}
+
+
+#[cfg(target_os = "android")]
+use std::ffi::CString;
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_print(prio: i32, tag: *const i8, fmt: *const i8, ...) -> i32;
+}
+#[cfg(target_os = "android")]
+#[inline]
+fn android_log(tag: &str, msg: &str) {
+    if let (Ok(tag_c), Ok(msg_c)) = (CString::new(tag), CString::new(msg)) {
+        unsafe {
+            __android_log_print(
+                4,
+                tag_c.as_ptr() as *const i8,
+                msg_c.as_ptr() as *const i8,
+            );
+        }
+    }
 }
 
 impl Server {
@@ -393,7 +420,18 @@ impl Server {
                 continue;
             }
             if !noperms.contains(&(&name as _)) {
+                #[cfg(target_os = "android")]
+                if name == audio_service::NAME {
+                    log::info!("MDM-AudioServiceSubscribe conn_id={} source=add_connection", conn.id());
+                    android_log("rustdesk_audio", &format!("MDM-AudioServiceSubscribe conn_id={} source=add_connection", conn.id()));
+                }
                 s.on_subscribe(conn.clone());
+            } else {
+                #[cfg(target_os = "android")]
+                if name == audio_service::NAME {
+                    log::info!("MDM-AudioServiceSkip conn_id={} source=add_connection reason=noperms", conn.id());
+                    android_log("rustdesk_audio", &format!("MDM-AudioServiceSkip conn_id={} source=add_connection reason=noperms", conn.id()));
+                }
             }
         }
         #[cfg(target_os = "macos")]
@@ -434,6 +472,18 @@ impl Server {
         if let Some(s) = self.services.get(name) {
             if s.is_subed(conn.id()) == sub {
                 return;
+            }
+            #[cfg(target_os = "android")]
+            if name == audio_service::NAME {
+                log::info!(
+                    "MDM-AudioServiceSubscribe conn_id={} source=explicit sub={}",
+                    conn.id(),
+                    sub
+                );
+                android_log("rustdesk_audio", &format!(
+                    "MDM-AudioServiceSubscribe conn_id={} source=explicit sub={}",
+                    conn.id(), sub
+                ));
             }
             if sub {
                 s.on_subscribe(conn.clone());

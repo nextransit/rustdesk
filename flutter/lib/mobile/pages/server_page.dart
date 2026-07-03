@@ -582,7 +582,7 @@ class _PermissionCheckerState extends State<PermissionChecker> {
   @override
   Widget build(BuildContext context) {
     final serverModel = Provider.of<ServerModel>(context);
-    final hasAudioPermission = androidVersion >= 30;
+    final hasAudioPermission = androidVersion >= 23;
     final hideStopService = isAndroid &&
         bind.mainGetBuildinOption(key: kOptionHideStopService) == 'Y';
     final allowPermChangeInAcceptWindow = option2bool(

@@ -13,10 +13,32 @@
 // https://github.com/krruzic/pulsectl
 
 use super::*;
+
+#[cfg(target_os = "android")]
+use std::ffi::CString;
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_print(prio: i32, tag: *const i8, fmt: *const i8, ...) -> i32;
+}
+#[cfg(target_os = "android")]
+#[inline]
+fn android_log(tag: &str, msg: &str) {
+    if let (Ok(tag_c), Ok(msg_c)) = (CString::new(tag), CString::new(msg)) {
+        unsafe {
+            __android_log_print(
+                4,
+                tag_c.as_ptr() as *const i8,
+                msg_c.as_ptr() as *const i8,
+            );
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use hbb_common::anyhow::anyhow;
 use magnum_opus::{Application::*, Channels::*, Encoder};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub const NAME: &'static str = "audio";
 pub const AUDIO_DATA_SIZE_U8: usize = 960 * 4; // 10ms in 48000 stereo
@@ -79,6 +101,7 @@ pub fn restart() {
 mod pa_impl {
     use super::*;
 
+
     // SAFETY: constrains of hbb_common::mem::aligned_u8_vec must be held
     unsafe fn align_to_32(data: Vec<u8>) -> Vec<u8> {
         if (data.as_ptr() as usize & 3) == 0 {
@@ -114,9 +137,24 @@ mod pa_impl {
         let zero_audio_frame: Vec<f32> = vec![0.; AUDIO_DATA_SIZE_U8 / 4];
         #[cfg(target_os = "android")]
         let mut android_data = vec![];
+        #[cfg(target_os = "android")]
+        let mut stats = AndroidAudioServiceStats::new();
         while sp.ok() && !RESTARTING.load(Ordering::SeqCst) {
             sp.snapshot(|sps| {
                 sps.send(create_format_msg(crate::platform::PA_SAMPLE_RATE, 2));
+                #[cfg(target_os = "android")]
+                log::info!(
+                    "MDM-AudioServiceFormat sample_rate={} channels=2",
+                    crate::platform::PA_SAMPLE_RATE
+                );
+                #[cfg(target_os = "android")]
+                android_log(
+                    "rustdesk_audio",
+                    &format!(
+                        "MDM-AudioServiceFormat sample_rate={} channels=2",
+                        crate::platform::PA_SAMPLE_RATE
+                    ),
+                );
                 Ok(())
             })?;
 
@@ -139,20 +177,201 @@ mod pa_impl {
             }
 
             #[cfg(target_os = "android")]
-            if scrap::android::ffi::get_audio_raw(&mut android_data, &mut vec![]).is_some() {
-                let data = unsafe {
-                    android_data = align_to_32(android_data);
-                    std::slice::from_raw_parts::<f32>(
-                        android_data.as_ptr() as _,
-                        android_data.len() / 4,
-                    )
-                };
-                send_f32(data, &mut encoder, &sp);
-            } else {
-                hbb_common::sleep(0.1).await;
+            {
+                // MDM v6: pace the audio run loop at 50 pkt/s only while the
+                // AudioRecord is actually producing frames OR during the
+                // initial 1s filler after a stall. When the recorder is
+                // stopped (FFI enable=false), drop into a 100ms idle sleep so
+                // the MediaProjection video encoder is not starved by us
+                // busy-looping silence-pads.
+                let target_frame_floats = crate::platform::PA_SAMPLE_RATE as usize
+                    * 2 /*channels*/
+                    * 20 /*ms*/
+                    / 1000;
+                if !scrap::android::ffi::audio_raw_is_enabled() {
+                    if stats.idle_logged.elapsed() >= Duration::from_secs(5) {
+                        log::info!(
+                            "MDM-AudioServiceIdle empty_takes={} raw_takes={} opus_packets={} silence_pads={}",
+                            stats.empty_takes,
+                            stats.raw_takes,
+                            stats.opus_packets,
+                            stats.silence_pads,
+                        );
+                        android_log(
+                            "rustdesk_audio",
+                            &format!(
+                                "MDM-AudioServiceIdle empty_takes={} raw_takes={} opus_packets={} silence_pads={}",
+                                stats.empty_takes,
+                                stats.raw_takes,
+                                stats.opus_packets,
+                                stats.silence_pads,
+                            ),
+                        );
+                        stats.idle_logged = Instant::now();
+                    }
+                    hbb_common::sleep(0.1).await;
+                    continue;
+                }
+                let now = Instant::now();
+                let next_due = stats.next_frame_due;
+                if now < next_due {
+                    let to_sleep = (next_due - now).as_millis().min(20) as u64;
+                    if to_sleep > 0 {
+                        hbb_common::sleep(to_sleep as f32 / 1000.0).await;
+                    }
+                    continue;
+                }
+                let _ = scrap::android::ffi::get_audio_raw(&mut android_data, &mut vec![]);
+                if !android_data.is_empty() {
+                    stats.raw_take(android_data.len());
+                    let data = unsafe {
+                        android_data = align_to_32(android_data);
+                        std::slice::from_raw_parts::<f32>(
+                            android_data.as_ptr() as _,
+                            android_data.len() / 4,
+                        )
+                    };
+                    let sent = send_f32(data, &mut encoder, &sp);
+                    stats.opus_sent(sent);
+                    stats.missed_frames = 0;
+                } else {
+                    stats.empty_take();
+                    stats.missed_frames += 1;
+                    // Cap silence pad at 50 frames (1s) after the last raw
+                    // frame; afterwards sleep 100ms so we do not starve the
+                    // video encoder on devices that never deliver raw PCM.
+                    if stats.missed_frames <= 50 {
+                        let filler: Vec<f32> = vec![1.0e-7; target_frame_floats];
+                        let sent = send_f32(&filler, &mut encoder, &sp);
+                        if sent > 0 {
+                            stats.opus_sent(sent);
+                            stats.silence_pads += 1;
+                        }
+                    } else if stats.cooldown_logged.elapsed() >= Duration::from_secs(5) {
+                        log::warn!(
+                            "MDM-AudioServiceCooldown empty_takes={} raw_takes={} missed={} silence_pads={}",
+                            stats.empty_takes,
+                            stats.raw_takes,
+                            stats.missed_frames,
+                            stats.silence_pads,
+                        );
+                        android_log(
+                            "rustdesk_audio",
+                            &format!(
+                                "MDM-AudioServiceCooldown empty_takes={} raw_takes={} missed={} silence_pads={}",
+                                stats.empty_takes,
+                                stats.raw_takes,
+                                stats.missed_frames,
+                                stats.silence_pads,
+                            ),
+                        );
+                        stats.cooldown_logged = Instant::now();
+                    }
+                }
+                stats.next_frame_due = now + Duration::from_millis(20);
+                if stats.last_raw_take.elapsed() > Duration::from_millis(500)
+                    && stats.empty_takes_since_raw >= 5
+                {
+                    log::warn!(
+                        "MDM-AudioServiceStall empty_takes={} raw_takes={} since_last_raw_ms={:?} missed={} silence_pads={}",
+                        stats.empty_takes,
+                        stats.raw_takes,
+                        stats.last_raw_take.elapsed(),
+                        stats.missed_frames,
+                        stats.silence_pads
+                    );
+                    android_log(
+                        "rustdesk_audio",
+                        &format!(
+                            "MDM-AudioServiceStall empty_takes={} raw_takes={} since_last_raw_ms={} missed={} silence_pads={}",
+                            stats.empty_takes,
+                            stats.raw_takes,
+                            stats.last_raw_take.elapsed().as_millis(),
+                            stats.missed_frames,
+                            stats.silence_pads
+                        ),
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    struct AndroidAudioServiceStats {
+        raw_takes: u64,
+        raw_bytes: u64,
+        empty_takes: u64,
+        opus_packets: u64,
+        last_log: Instant,
+        last_raw_take: Instant,
+        empty_takes_since_raw: u64,
+        pcm_buffered_samples: usize,
+        missed_frames: u64,
+        silence_pads: u64,
+        next_frame_due: Instant,
+        idle_logged: Instant,
+        cooldown_logged: Instant,
+    }
+
+    #[cfg(target_os = "android")]
+    impl AndroidAudioServiceStats {
+        fn new() -> Self {
+            Self {
+                raw_takes: 0,
+                raw_bytes: 0,
+                empty_takes: 0,
+                opus_packets: 0,
+                last_log: Instant::now(),
+                last_raw_take: Instant::now(),
+                empty_takes_since_raw: 0,
+                pcm_buffered_samples: 0,
+                missed_frames: 0,
+                silence_pads: 0,
+                next_frame_due: Instant::now(),
+                idle_logged: Instant::now(),
+                cooldown_logged: Instant::now(),
+            }
+        }
+
+        fn raw_take(&mut self, bytes: usize) {
+            self.raw_takes += 1;
+            self.raw_bytes += bytes as u64;
+            self.last_raw_take = Instant::now();
+            self.empty_takes_since_raw = 0;
+            self.maybe_log(bytes, "raw");
+        }
+
+        fn empty_take(&mut self) {
+            self.empty_takes += 1;
+            self.empty_takes_since_raw += 1;
+            self.maybe_log(0, "empty");
+        }
+
+        fn opus_sent(&mut self, packets: usize) {
+            self.opus_packets += packets as u64;
+            self.maybe_log(0, "opus");
+        }
+
+        fn maybe_log(&mut self, last_raw_bytes: usize, reason: &str) {
+            if self.raw_takes <= 1 || self.last_log.elapsed() >= Duration::from_secs(5) {
+                self.last_log = Instant::now();
+                log::info!(
+                    "MDM-AudioServiceStats reason={} raw_takes={} raw_bytes={} empty_takes={} opus_packets={} last_raw_bytes={}",
+                    reason,
+                    self.raw_takes,
+                    self.raw_bytes,
+                    self.empty_takes,
+                    self.opus_packets,
+                    last_raw_bytes
+                );
+                #[cfg(target_os = "android")]
+                android_log("rustdesk_audio", &format!(
+                    "MDM-AudioServiceStats reason={} raw_takes={} raw_bytes={} empty_takes={} opus_packets={} last_raw_bytes={}",
+                    reason, self.raw_takes, self.raw_bytes, self.empty_takes, self.opus_packets, last_raw_bytes
+                ));
+            }
+        }
     }
 }
 
@@ -168,6 +387,8 @@ pub fn is_screen_capture_kit_available() -> bool {
 mod cpal_impl {
     use self::service::{Reset, ServiceSwap};
     use super::*;
+
+
     use cpal::{
         traits::{DeviceTrait, HostTrait, StreamTrait},
         BufferSize, Device, Host, InputCallbackInfo, StreamConfig, SupportedStreamConfig,
@@ -465,7 +686,7 @@ fn create_format_msg(sample_rate: u32, channels: u16) -> Message {
 const MAX_AUDIO_ZERO_COUNT: u16 = 800;
 static mut AUDIO_ZERO_COUNT: u16 = 0;
 
-fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
+fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) -> usize {
     if data.iter().filter(|x| **x != 0.).next().is_some() {
         unsafe {
             AUDIO_ZERO_COUNT = 0;
@@ -477,7 +698,7 @@ fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
                     log::debug!("Audio Zero Gate Attack");
                     AUDIO_ZERO_COUNT += 1;
                 }
-                return;
+                return 0;
             }
             AUDIO_ZERO_COUNT += 1;
         }
@@ -489,6 +710,7 @@ fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
         // then upload in batches
         const BATCH_SIZE: usize = 960;
         let input_size = data.len();
+        let mut sent = 0;
         if input_size > BATCH_SIZE && input_size % BATCH_SIZE == 0 {
             let n = input_size / BATCH_SIZE;
             for i in 0..n {
@@ -502,18 +724,27 @@ fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
                             ..Default::default()
                         });
                         sp.send(msg_out);
+                        sent += 1;
                     }
-                    Err(_) => {}
+                    Err(err) => {
+                        log::warn!(
+                            "MDM-AudioServiceEncodeFailed batch={} input_size={} error={}",
+                            i,
+                            input_size,
+                            err
+                        );
+                    }
                 }
             }
         } else {
-            log::debug!("invalid audio data size:{} ", input_size);
-            return;
+            log::warn!("MDM-AudioServiceInvalidInputSize input_size={}", input_size);
+            return 0;
         }
+        return sent;
     }
 
     #[cfg(not(target_os = "android"))]
-    match encoder.encode_vec_float(data, data.len() * 6) {
+    return match encoder.encode_vec_float(data, data.len() * 6) {
         Ok(data) => {
             let mut msg_out = Message::new();
             msg_out.set_audio_frame(AudioFrame {
@@ -521,7 +752,8 @@ fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) {
                 ..Default::default()
             });
             sp.send(msg_out);
+            1
         }
-        Err(_) => {}
-    }
+        Err(_) => 0,
+    };
 }

@@ -197,11 +197,11 @@ class ServerModel with ChangeNotifier {
 
   /// 1. check android permission
   /// 2. check config
-  /// audio true by default (if permission on) (false default < Android 10)
+  /// audio true by default (if permission on). API 28 uses microphone fallback.
   /// file true by default (if permission on)
   checkAndroidPermission() async {
     // audio
-    if (androidVersion < 30 ||
+    if (androidVersion < 23 ||
         !await AndroidPermissionManager.check(kRecordAudio)) {
       _audioOk = false;
       bind.mainSetOption(key: kOptionEnableAudio, value: "N");

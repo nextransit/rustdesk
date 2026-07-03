@@ -538,6 +538,8 @@ impl Connection {
             terminal_generic_service: None,
         };
         let addr = hbb_common::try_into_v4(addr);
+        #[cfg(target_os = "android")]
+        android_log("rustdesk_conn", &format!("Connection::start entered id={} audio={} disable_audio={} keyboard={} clipboard={}", id, conn.audio, conn.disable_audio, conn.keyboard, conn.clipboard));
         if !conn.on_open(addr).await {
             conn.closed = true;
             // sleep to ensure msg got received.
@@ -559,6 +561,29 @@ impl Connection {
         if !conn.audio {
             conn.send_permission(Permission::Audio, false).await;
         }
+        #[cfg(target_os = "android")]
+        log::info!(
+            "MDM-AudioPermission conn_id={} audio={} disable_audio={} audio_enabled={} enable_audio_option={} disable_audio_option={}",
+            conn.inner.id(),
+            conn.audio,
+            conn.disable_audio,
+            conn.audio_enabled(),
+            Config::get_option(keys::OPTION_ENABLE_AUDIO),
+            Config::get_option("disable-audio")
+        );
+        #[cfg(target_os = "android")]
+        android_log(
+            "rustdesk_audio",
+            &format!(
+                "MDM-AudioPermission conn_id={} audio={} disable_audio={} audio_enabled={} enable_audio_option={} disable_audio_option={}",
+                conn.inner.id(),
+                conn.audio,
+                conn.disable_audio,
+                conn.audio_enabled(),
+                Config::get_option(keys::OPTION_ENABLE_AUDIO),
+                Config::get_option("disable-audio")
+            ),
+        );
         if !conn.file {
             conn.send_permission(Permission::File, false).await;
         }
@@ -1860,6 +1885,8 @@ impl Connection {
     }
 
     fn try_sub_monitor_services(&mut self) {
+        #[cfg(target_os = "android")]
+        android_log("rustdesk_audio", &format!("try_sub_monitor_services entered is_remote={} services_subed={} terminal={} view_camera={} file_transfer={} port_forward={}", self.is_remote(), self.services_subed, self.terminal, self.view_camera, self.file_transfer.is_some(), self.port_forward_address != ""));
         let is_remote = self.is_remote();
         if is_remote && !self.services_subed {
             self.services_subed = true;
@@ -1884,6 +1911,27 @@ impl Connection {
                 if !self.audio_enabled() {
                     noperms.push(super::audio_service::NAME);
                 }
+                #[cfg(target_os = "android")]
+                log::info!(
+                    "MDM-AudioTrySub conn_id={} audio={} disable_audio={} audio_enabled={} noperms={:?}",
+                    self.inner.id(),
+                    self.audio,
+                    self.disable_audio,
+                    self.audio_enabled(),
+                    noperms
+                );
+                #[cfg(target_os = "android")]
+                android_log(
+                    "rustdesk_audio",
+                    &format!(
+                        "MDM-AudioTrySub conn_id={} audio={} disable_audio={} audio_enabled={} noperms={:?}",
+                        self.inner.id(),
+                        self.audio,
+                        self.disable_audio,
+                        self.audio_enabled(),
+                        noperms
+                    ),
+                );
                 let mut s = s.write().unwrap();
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let _h = try_start_record_cursor_pos();
@@ -1974,6 +2022,8 @@ impl Connection {
     }
 
     fn try_start_cm(&mut self, peer_id: String, name: String, authorized: bool) {
+        #[cfg(target_os = "android")]
+        android_log("rustdesk_conn", &format!("try_start_cm peer_id={} authorized={} view_camera={} terminal={} file_transfer={} port_forward={}", peer_id, authorized, self.view_camera, self.terminal, self.file_transfer.is_some(), self.port_forward_address != ""));
         self.send_to_cm(ipc::Data::Login {
             id: self.inner.id(),
             is_file_transfer: self.file_transfer.is_some(),
@@ -2699,8 +2749,16 @@ impl Connection {
                         return true;
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
-                    if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
-                        log::debug!("call_main_service_pointer_input fail:{}", e);
+                    {
+                        log::info!(
+                            "MDM-InputDispatch type=mouse mask={} x={} y={}",
+                            me.mask,
+                            me.x,
+                            me.y
+                        );
+                        if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
+                            log::warn!("MDM-InputDispatchFailed type=mouse error={}", e);
+                        }
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {
@@ -2819,9 +2877,16 @@ impl Connection {
 
                     match encode_result {
                         Ok(data) => {
+                            log::info!(
+                                "MDM-InputDispatch type=key bytes={} press={} down={} mode={:?}",
+                                data.len(),
+                                me.press,
+                                me.down,
+                                me.mode.enum_value()
+                            );
                             let result = call_main_service_key_event(&data);
                             if let Err(e) = result {
-                                log::debug!("call_main_service_key_event fail: {}", e);
+                                log::warn!("MDM-InputDispatchFailed type=key error={}", e);
                             }
                         }
                         Err(e) => {

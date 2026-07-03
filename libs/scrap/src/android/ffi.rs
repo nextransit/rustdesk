@@ -9,6 +9,30 @@ use jni::{
     JavaVM,
 };
 
+#[cfg(target_os = "android")]
+use std::ffi::CString;
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_print(prio: i32, tag: *const i8, fmt: *const i8, ...) -> i32;
+}
+
+const ANDROID_LOG_INFO: i32 = 4;
+
+#[cfg(target_os = "android")]
+#[inline]
+fn android_log(tag: &str, msg: &str) {
+    if let (Ok(tag_c), Ok(msg_c)) = (CString::new(tag), CString::new(msg)) {
+        unsafe {
+            __android_log_print(
+                ANDROID_LOG_INFO,
+                tag_c.as_ptr() as *const i8,
+                msg_c.as_ptr() as *const i8,
+            );
+        }
+    }
+}
+
 use hbb_common::{message_proto::MultiClipboards, protobuf::Message};
 use jni::errors::{Error as JniError, Result as JniResult};
 use lazy_static::lazy_static;
@@ -186,6 +210,9 @@ pub fn get_video_raw<'a>(dst: &mut Vec<u8>, last: &mut Vec<u8>) -> Option<()> {
     VIDEO_RAW.lock().ok()?.take(dst, last)
 }
 
+pub fn audio_raw_is_enabled() -> bool {
+    AUDIO_RAW.lock().map(|r| r.enable).unwrap_or(false)
+}
 pub fn get_audio_raw<'a>(dst: &mut Vec<u8>, last: &mut Vec<u8>) -> Option<()> {
     AUDIO_RAW.lock().ok()?.take(dst, last)
 }
@@ -218,11 +245,22 @@ pub extern "system" fn Java_ffi_FFI_onAudioFrameUpdate(
     _class: JClass,
     buffer: JObject,
 ) {
+    static mut FIRST: i32 = 0;
     let jb = JByteBuffer::from(buffer);
     if let Ok(data) = env.get_direct_buffer_address(&jb) {
         if let Ok(len) = env.get_direct_buffer_capacity(&jb) {
             AUDIO_RAW.lock().unwrap().update(data, len);
+            unsafe {
+                if FIRST < 3 {
+                    FIRST += 1;
+                    android_log("rustdesk_native", &format!("Java_ffi_FFI_onAudioFrameUpdate first len={}", len));
+                }
+            }
+        } else {
+            android_log("rustdesk_native", "onAudioFrameUpdate get_direct_buffer_capacity failed");
         }
+    } else {
+        android_log("rustdesk_native", "onAudioFrameUpdate get_direct_buffer_address failed");
     }
 }
 
@@ -254,15 +292,19 @@ pub extern "system" fn Java_ffi_FFI_setFrameRawEnable(
     name: JString,
     value: jboolean,
 ) {
+    android_log("rustdesk_native", "Java_ffi_FFI_setFrameRawEnable entered");
     let mut env = env;
     if let Ok(name) = env.get_string(&name) {
         let name: String = name.into();
         let value = value.eq(&1);
+        android_log("rustdesk_native", &format!("Java_ffi_FFI_setFrameRawEnable name={} value={}", name, value));
         if name.eq("video") {
             VIDEO_RAW.lock().unwrap().set_enable(value);
         } else if name.eq("audio") {
             AUDIO_RAW.lock().unwrap().set_enable(value);
         }
+    } else {
+        android_log("rustdesk_native", "Java_ffi_FFI_setFrameRawEnable get_string failed");
     };
 }
 

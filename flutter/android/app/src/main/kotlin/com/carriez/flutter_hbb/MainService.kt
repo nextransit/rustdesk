@@ -88,6 +88,9 @@ class MainService : Service() {
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
     fun rustKeyEventInput(input: ByteArray) {
+        if (MdmInputFallback.key(applicationContext, input)) {
+            return
+        }
         InputService.ctx?.onKeyEvent(input)
     }
 
@@ -663,7 +666,7 @@ class MainService : Service() {
             Log.i(logTag, "MDM audio disabled while service running")
             return true
         }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isStart || mediaProjection == null) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || !isStart) {
             Log.i(
                 logTag,
                 "MDM audio enabled but capture is not ready sdk=${Build.VERSION.SDK_INT} isStart=$isStart mediaProjection=${mediaProjection != null}"
@@ -674,10 +677,9 @@ class MainService : Service() {
             return true
         }
         val projection = mediaProjection ?: return false
-        return if (audioRecordHandle.createAudioRecorder(false, projection)) {
+        return if (audioRecordHandle.createAudioRecorder(false, projection) && audioRecordHandle.startAudioRecorder()) {
             _isAudioStart = true
-            audioRecordHandle.startAudioRecorder()
-            Log.i(logTag, "MDM audio recorder started while capture is running")
+            Log.i(logTag, "MDM audio recorder started while capture is running sdk=${Build.VERSION.SDK_INT}")
             true
         } else {
             _isAudioStart = false
@@ -804,14 +806,13 @@ class MainService : Service() {
             return false
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMdmAudioEnabled()) {
-            if (!audioRecordHandle.createAudioRecorder(false, activeProjection)) {
-                Log.d(logTag, "createAudioRecorder fail")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && isMdmAudioEnabled()) {
+            if (!audioRecordHandle.createAudioRecorder(false, activeProjection) || !audioRecordHandle.startAudioRecorder()) {
+                Log.d(logTag, "createAudioRecorder/startAudioRecorder fail")
                 _isAudioStart = false
             } else {
-                Log.d(logTag, "audio recorder start")
                 _isAudioStart = true
-                audioRecordHandle.startAudioRecorder()
+                Log.i(logTag, "MDM audio recorder start requested sdk=${Build.VERSION.SDK_INT}")
             }
         } else {
             _isAudioStart = false
