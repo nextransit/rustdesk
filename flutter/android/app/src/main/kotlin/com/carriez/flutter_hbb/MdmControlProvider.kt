@@ -73,13 +73,14 @@ class MdmControlProvider : ContentProvider() {
         val hbbs = extras?.getString(EXTRA_HBBS)?.trim().orEmpty()
         val hbbr = extras?.getString(EXTRA_HBBR)?.trim().orEmpty()
         val key = extras?.getString(EXTRA_KEY)?.trim().orEmpty()
+        val audioEnabled = extras?.getBoolean(EXTRA_AUDIO_ENABLED, false) ?: false
         require(hbbs.isNotBlank()) { "hbbs is required" }
         require(hbbr.isNotBlank()) { "hbbr is required" }
 
         // Let RustDesk write its own config as the app uid. MDM agent cannot
         // write RustDesk private files directly on non-root devices.
         val appDir = configDir()
-        Log.i(TAG, "MDM-debug setServerConfig start: appDir=${appDir.absolutePath} hbbs=$hbbs hbbr=$hbbr keyLen=${key.length}")
+        Log.i(TAG, "MDM-debug setServerConfig start: appDir=${appDir.absolutePath} hbbs=$hbbs hbbr=$hbbr audio=$audioEnabled keyLen=${key.length}")
         val ok1 = FFI.setOption(appDir.absolutePath, "custom-rendezvous-server", hbbs)
         val after1 = FFI.getLocalOption("custom-rendezvous-server")
         Log.i(TAG, "MDM-debug FFI.setOption(hbbs)=$ok1 readback=$after1")
@@ -89,8 +90,16 @@ class MdmControlProvider : ContentProvider() {
         val ok3 = FFI.setOption(appDir.absolutePath, "key", key)
         val after3 = FFI.getLocalOption("key")
         Log.i(TAG, "MDM-debug FFI.setOption(key)=$ok3 readbackLen=${after3?.length ?: -1}")
-        val ok = ok1 && ok2 && ok3
-        require(ok) { "set RustDesk server options failed (hbbs=$ok1 hbbr=$ok2 key=$ok3)" }
+        val ok4 = FFI.setOption(appDir.absolutePath, "enable-audio", if (audioEnabled) "Y" else "N")
+        val ok5 = FFI.setOption(appDir.absolutePath, "disable-audio", if (audioEnabled) "N" else "Y")
+        context?.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
+            ?.edit()
+            ?.putBoolean(KEY_MDM_AUDIO_ENABLED, audioEnabled)
+            ?.apply()
+        val runtimeAudioApplied = MainService.applyMdmAudioEnabled(audioEnabled)
+        Log.i(TAG, "MDM-debug FFI.setOption(audio) enable=$ok4 disable=$ok5 runtimeApplied=$runtimeAudioApplied")
+        val ok = ok1 && ok2 && ok3 && ok4 && ok5
+        require(ok) { "set RustDesk server options failed (hbbs=$ok1 hbbr=$ok2 key=$ok3 enableAudio=$ok4 disableAudio=$ok5)" }
         Log.i(TAG, "MDM-debug FFI.startServer called")
         FFI.startServer(appDir.absolutePath, "")
         val myId = FFI.getMyId(appDir.absolutePath)
@@ -273,6 +282,8 @@ class MdmControlProvider : ContentProvider() {
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
                 putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
                 putBoolean(KEY_STATUS_INPUT_READY, InputService.ctx != null || MdmInputFallback.isAvailable(ctx))
+                putBoolean(KEY_STATUS_AUDIO_ENABLED, isMdmAudioEnabled())
+                putBoolean(KEY_STATUS_AUDIO_RUNNING, MainService.isAudioStart)
                 putLong(KEY_STATUS_CAPTURE_FRAMES, MainService.captureFrames)
                 putLong(KEY_STATUS_CAPTURE_BYTES, MainService.captureBytes)
                 putLong(KEY_STATUS_CAPTURE_DROPPED_FRAMES, MainService.captureDroppedFrames)
@@ -333,6 +344,12 @@ class MdmControlProvider : ContentProvider() {
         return File(ctx.applicationInfo.dataDir, "app_flutter").apply {
             if (!exists()) mkdirs()
         }
+    }
+
+    private fun isMdmAudioEnabled(): Boolean {
+        val ctx = context ?: return false
+        return ctx.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
+            .getBoolean(KEY_MDM_AUDIO_ENABLED, false)
     }
 
     private fun readToml(file: File): List<String> {
@@ -466,6 +483,7 @@ class MdmControlProvider : ContentProvider() {
         private const val EXTRA_KEY = "key"
         private const val EXTRA_PASSWORD = "password"
         private const val EXTRA_FROM_BOOT = "from_boot"
+        private const val EXTRA_AUDIO_ENABLED = "audio_enabled"
 
         private const val KEY_SUCCESS = "success"
         private const val KEY_ERROR = "error"
@@ -475,6 +493,8 @@ class MdmControlProvider : ContentProvider() {
         private const val KEY_STATUS_MEDIA_READY = "media_ready"
         private const val KEY_STATUS_CAPTURING = "capturing"
         private const val KEY_STATUS_INPUT_READY = "input_ready"
+        private const val KEY_STATUS_AUDIO_ENABLED = "audio_enabled"
+        private const val KEY_STATUS_AUDIO_RUNNING = "audio_running"
         private const val KEY_STATUS_CAPTURE_FRAMES = "capture_frames"
         private const val KEY_STATUS_CAPTURE_BYTES = "capture_bytes"
         private const val KEY_STATUS_CAPTURE_DROPPED_FRAMES = "capture_dropped_frames"

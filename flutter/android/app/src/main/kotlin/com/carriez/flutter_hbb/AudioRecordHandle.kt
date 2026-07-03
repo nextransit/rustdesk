@@ -185,6 +185,10 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
         if (isAudioStart() || isVideoStart()) {
             return
         }
+        stopAudioRecorder()
+    }
+
+    fun stopAudioRecorder() {
         audioRecordStat = false
         audioThread?.join()
         audioThread = null

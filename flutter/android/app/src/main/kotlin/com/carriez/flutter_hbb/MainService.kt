@@ -159,6 +159,10 @@ class MainService : Service() {
                     val peerId = jsonObject["peer_id"] as String
                     val inVoiceCall = jsonObject["in_voice_call"] as Boolean
                     val incomingVoiceCall = jsonObject["incoming_voice_call"] as Boolean
+                    if (!isMdmAudioEnabled()) {
+                        Log.i(logTag, "update_voice_call_state ignored because MDM audio is disabled")
+                        return
+                    }
                     if (!inVoiceCall) {
                         if (incomingVoiceCall) {
                             voiceCallRequestNotification(id, "Voice Call Request", username, peerId)
@@ -255,6 +259,7 @@ class MainService : Service() {
         @Volatile private var captureLastStatsLogByteCount = 0L
         @Volatile private var captureLastError: String? = null
         @Volatile private var mediaProjectionRequestStartedAtMs = 0L
+        @Volatile private var activeInstance: MainService? = null
         val isReady: Boolean
             get() = _isReady
         val isStart: Boolean
@@ -376,6 +381,10 @@ class MainService : Service() {
                     "last_error=${captureLastError ?: ""}"
             )
         }
+
+        fun applyMdmAudioEnabled(enabled: Boolean): Boolean {
+            return activeInstance?.applyMdmAudioEnabledNow(enabled) ?: false
+        }
     }
 
     private val logTag = "LOG_SERVICE"
@@ -446,6 +455,7 @@ class MainService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         Log.d(logTag,"MainService onCreate, sdk int:${Build.VERSION.SDK_INT} reuseVirtualDisplay:$reuseVirtualDisplay")
         FFI.init(this)
         HandlerThread("Service", Process.THREAD_PRIORITY_BACKGROUND).apply {
@@ -470,6 +480,9 @@ class MainService : Service() {
 
     override fun onDestroy() {
         checkMediaPermission()
+        if (activeInstance === this) {
+            activeInstance = null
+        }
         releaseScreenWakeLock("service_destroy")
         stopService(Intent(this, FloatingWindowService::class.java))
         super.onDestroy()
@@ -636,6 +649,43 @@ class MainService : Service() {
 
     private fun appFlutterDir(): String = "${applicationInfo.dataDir}/app_flutter"
 
+    private fun isMdmAudioEnabled(): Boolean {
+        return applicationContext
+            .getSharedPreferences(KEY_SHARED_PREFERENCES, FlutterActivity.MODE_PRIVATE)
+            .getBoolean(KEY_MDM_AUDIO_ENABLED, false)
+    }
+
+    @Synchronized
+    private fun applyMdmAudioEnabledNow(enabled: Boolean): Boolean {
+        if (!enabled) {
+            _isAudioStart = false
+            audioRecordHandle.stopAudioRecorder()
+            Log.i(logTag, "MDM audio disabled while service running")
+            return true
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isStart || mediaProjection == null) {
+            Log.i(
+                logTag,
+                "MDM audio enabled but capture is not ready sdk=${Build.VERSION.SDK_INT} isStart=$isStart mediaProjection=${mediaProjection != null}"
+            )
+            return false
+        }
+        if (_isAudioStart) {
+            return true
+        }
+        val projection = mediaProjection ?: return false
+        return if (audioRecordHandle.createAudioRecorder(false, projection)) {
+            _isAudioStart = true
+            audioRecordHandle.startAudioRecorder()
+            Log.i(logTag, "MDM audio recorder started while capture is running")
+            true
+        } else {
+            _isAudioStart = false
+            Log.w(logTag, "MDM audio recorder start failed while capture is running")
+            false
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         updateScreenInfo(newConfig.orientation)
@@ -754,13 +804,18 @@ class MainService : Service() {
             return false
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMdmAudioEnabled()) {
             if (!audioRecordHandle.createAudioRecorder(false, activeProjection)) {
                 Log.d(logTag, "createAudioRecorder fail")
+                _isAudioStart = false
             } else {
                 Log.d(logTag, "audio recorder start")
+                _isAudioStart = true
                 audioRecordHandle.startAudioRecorder()
             }
+        } else {
+            _isAudioStart = false
+            Log.d(logTag, "audio recorder disabled by MDM or unsupported sdk=${Build.VERSION.SDK_INT}")
         }
         checkMediaPermission()
         FFI.setFrameRawEnable("video",true)
