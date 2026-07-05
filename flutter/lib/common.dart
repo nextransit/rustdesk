@@ -1596,6 +1596,12 @@ String translate(String name) {
 // This function must be kept the same as the one in rust and sciter code.
 // rust: libs/hbb_common/src/config.rs -> option2bool()
 // sciter: Does not have the function, but it should be kept the same.
+// P0-fix(mdm-companion-defaults): 在 MDM 控车专网场景下, 把以下 3 个选项的默认值改为开启,
+//   减少现场对每台车机手动配置的成本, 同时充分利用 LAN/专网 P2P 提升首帧速度:
+//   - kOptionEnableUdpPunch       (UDP hole punching)
+//   - kOptionEnableIpv6Punch      (IPv6 P2P)
+//   - kOptionAllowWebSocket       (use websocket 通道)
+//   kOptionAllowInsecureTLSFallback 保持默认 false (生产安全基线).
 bool option2bool(String option, String value) {
   bool res;
   if (option.startsWith("enable-")) {
@@ -1604,7 +1610,12 @@ bool option2bool(String option, String value) {
       option == kOptionStopService ||
       option == kOptionDirectServer ||
       option == kOptionForceAlwaysRelay) {
-    res = value == "Y";
+    // P0-fix: 显式给以下 3 个 allow-* 选项默认 yes (其他 allow-* 仍按 value==Y 走)
+    if (option == kOptionAllowWebSocket) {
+      res = value != defaultOptionNo;
+    } else {
+      res = value == "Y";
+    }
   } else {
     // "" is true
     res = value != "N";
@@ -1614,15 +1625,18 @@ bool option2bool(String option, String value) {
 
 String bool2option(String option, bool b) {
   String res;
-  if (option.startsWith('enable-') &&
-      option != kOptionEnableUdpPunch &&
-      option != kOptionEnableIpv6Punch) {
+  if (option.startsWith('enable-')) {
     res = b ? defaultOptionYes : 'N';
   } else if (option.startsWith('allow-') ||
       option == kOptionStopService ||
       option == kOptionDirectServer ||
       option == kOptionForceAlwaysRelay) {
-    res = b ? 'Y' : defaultOptionNo;
+    // P0-fix: 显式给以下 3 个选项默认 yes (其他 allow-* 仍按 defaultOptionNo 走)
+    if (option == kOptionAllowWebSocket) {
+      res = b ? defaultOptionYes : defaultOptionNo;
+    } else {
+      res = b ? 'Y' : defaultOptionNo;
+    }
   } else {
     res = b ? 'Y' : 'N';
   }

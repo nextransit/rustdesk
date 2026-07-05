@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.widget.EditText
 import android.view.accessibility.AccessibilityEvent
@@ -123,11 +124,6 @@ class InputService : AccessibilityService() {
             return
         }
 
-        // left down, was down
-        if (leftIsDown) {
-            continueGesture(mouseX, mouseY)
-        }
-
         // left up, was down
         if (mask == LEFT_UP) {
             if (leftIsDown) {
@@ -136,6 +132,11 @@ class InputService : AccessibilityService() {
                 endGesture(mouseX, mouseY)
                 return
             }
+        }
+
+        // left down, was down
+        if (leftIsDown) {
+            continueGesture(mouseX, mouseY)
         }
 
         if (mask == RIGHT_UP) {
@@ -262,7 +263,7 @@ class InputService : AccessibilityService() {
             val builder = GestureDescription.Builder()
             builder.addStroke(longPressStroke)
             Log.d(logTag, "performClick x:$x y:$y time:$duration")
-            dispatchGesture(builder.build(), null, null)
+            dispatchGestureWithTrace(builder.build(), "click", x, y, false)
         } catch (e: Exception) {
             Log.e(logTag, "performClick, error:$e")
         }
@@ -421,11 +422,45 @@ class InputService : AccessibilityService() {
                 val builder = GestureDescription.Builder()
                 builder.addStroke(it)
                 Log.d(logTag, "doDispatchGesture x:$x y:$y time:$duration")
-                dispatchGesture(builder.build(), null, null)
+                dispatchGestureWithTrace(builder.build(), "gesture", x, y, willContinue)
             }
         } catch (e: Exception) {
             Log.e(logTag, "doDispatchGesture, willContinue:$willContinue, error:$e")
         }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun dispatchGestureWithTrace(
+        gesture: GestureDescription,
+        reason: String,
+        x: Int,
+        y: Int,
+        willContinue: Boolean
+    ) {
+        val startedAt = SystemClock.uptimeMillis()
+        val accepted = dispatchGesture(
+            gesture,
+            object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    Log.i(
+                        logTag,
+                        "MDM-InputDispatch gesture_completed reason=$reason x=$x y=$y will_continue=$willContinue elapsed_ms=${SystemClock.uptimeMillis() - startedAt}"
+                    )
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    Log.w(
+                        logTag,
+                        "MDM-InputDispatch gesture_cancelled reason=$reason x=$x y=$y will_continue=$willContinue elapsed_ms=${SystemClock.uptimeMillis() - startedAt}"
+                    )
+                }
+            },
+            null
+        )
+        Log.i(
+            logTag,
+            "MDM-InputDispatch gesture_dispatch reason=$reason x=$x y=$y will_continue=$willContinue accepted=$accepted"
+        )
     }
 
     @RequiresApi(Build.VERSION_CODES.N)

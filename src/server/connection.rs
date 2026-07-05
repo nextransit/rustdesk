@@ -2006,6 +2006,14 @@ impl Connection {
     }
 
     fn audio_enabled(&self) -> bool {
+        #[cfg(target_os = "android")]
+        {
+            let mdm_audio_enabled = Config::get_option(keys::OPTION_ENABLE_AUDIO) == "Y"
+                && Config::get_option("disable-audio") != "Y";
+            if mdm_audio_enabled {
+                return self.audio;
+            }
+        }
         self.audio && !self.disable_audio
     }
 

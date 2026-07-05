@@ -70,28 +70,50 @@ class MainService : Service() {
         if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
             ensureScreenInteractive("pointer_input")
         }
-        if (MdmInputFallback.pointer(applicationContext, kind, mask, x, y)) {
+        val inputService = InputService.ctx
+        if (inputService != null) {
+            Log.i(
+                logTag,
+                "MDM-InputDispatch pointer_route=accessibility kind=$kind mask=$mask x=$x y=$y"
+            )
+            when (kind) {
+                0 -> { // touch
+                    inputService.onTouchInput(mask, x, y)
+                }
+                1 -> { // mouse
+                    inputService.onMouseInput(mask, x, y)
+                }
+                else -> {
+                    Log.w(logTag, "MDM-InputDispatch pointer_route=accessibility_ignored kind=$kind mask=$mask")
+                }
+            }
             return
         }
-        when (kind) {
-            0 -> { // touch
-                InputService.ctx?.onTouchInput(mask, x, y)
-            }
-            1 -> { // mouse
-                InputService.ctx?.onMouseInput(mask, x, y)
-            }
-            else -> {
-            }
+        Log.w(
+            logTag,
+            "MDM-InputDispatch pointer_route=provider_fallback reason=accessibility_unavailable kind=$kind mask=$mask x=$x y=$y"
+        )
+        if (!MdmInputFallback.pointer(applicationContext, kind, mask, x, y)) {
+            Log.w(logTag, "MDM-InputDispatch pointer_route=provider_fallback_failed kind=$kind mask=$mask")
         }
     }
 
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
     fun rustKeyEventInput(input: ByteArray) {
-        if (MdmInputFallback.key(applicationContext, input)) {
+        val inputService = InputService.ctx
+        if (inputService != null) {
+            Log.i(logTag, "MDM-InputDispatch key_route=accessibility bytes=${input.size}")
+            inputService.onKeyEvent(input)
             return
         }
-        InputService.ctx?.onKeyEvent(input)
+        Log.w(
+            logTag,
+            "MDM-InputDispatch key_route=provider_fallback reason=accessibility_unavailable bytes=${input.size}"
+        )
+        if (!MdmInputFallback.key(applicationContext, input)) {
+            Log.w(logTag, "MDM-InputDispatch key_route=provider_fallback_failed bytes=${input.size}")
+        }
     }
 
     @Keep
@@ -448,6 +470,11 @@ class MainService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaProjectionCallback: MediaProjection.Callback? = null
 
+    // P0-fix(mdm-companion-android-9): mdm screenrecord 路径用 MediaExtractor
+    private var mdmExtractor: MediaExtractor? = null
+    private var mdmDecoder: MediaCodec? = null
+    private var mdmReader: ImageReader? = null
+
     // audio
     private val audioRecordHandle = AudioRecordHandle(this, { isStart }, { isAudioStart })
 
@@ -773,9 +800,21 @@ class MainService : Service() {
             return false
         }
         keepScreenInteractive("start_capture")
-        
+
         updateScreenInfo(resources.configuration.orientation)
         Log.d(logTag, "Start Capture")
+
+        // P0-fix(mdm-companion-android-9): 优先检测 mdm-agent 提供的 screenrecord
+        // 文件 (system uid 1000 跑 shell screenrecord 写 h264 到公共目录).
+        // MediaExtractor 解码避开 MediaProjection + VirtualDisplaySurface bug.
+        if (useMdmSystemScreenrecord()) {
+            Log.i(logTag, "startCapture: routing to mdm screenrecord path (Android 9 bypass)")
+            if (startMdmScreenrecordCapture()) {
+                return true
+            }
+            Log.w(logTag, "mdm screenrecord path failed, falling back to MediaProjection")
+        }
+
         surface = createSurface()
         if (surface == null) {
             Log.w(logTag, "startCapture fail,surface is null")
@@ -1160,4 +1199,137 @@ class MainService : Service() {
             .build()
         notificationManager.notify(DEFAULT_NOTIFY_ID, notification)
     }
+
+    // ─── P0-fix(mdm-companion-android-9): mdm screenrecord 视频读取路径 ───
+    /**
+     * 检测 mdm-agent (uid 1000, system app) 是否在跑 shell `screenrecord` 写
+     * h264 到 /sdcard/Android/data/com.decard.mdm.agent/files/system_screen.h264.
+     * 如果是, flutter_hbb 改用 MediaExtractor 读这个 h264 文件 (不走 MediaProjection
+     * 流程), 彻底绕开 Android 9 SurfaceFlinger.getUniqueId() bug.
+     *
+     * 检测: 读 mdm 私有外部存储的 meta JSON + 验证文件存在 + 检查 screenrecord 进程.
+     */
+    private fun useMdmSystemScreenrecord(): Boolean {
+        return try {
+            val metaFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen_meta.json")
+            if (!metaFile.exists()) return false
+            val screenFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen.h264")
+            if (!screenFile.exists() || screenFile.length() < 1024) return false
+            val proc = Runtime.getRuntime().exec(arrayOf("pidof", "screenrecord"))
+            proc.waitFor() == 0
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * P0-fix: 启动 MediaExtractor + MediaCodec 解码器读 mdm screenrecord h264 文件,
+     * 把解码出的 RGBA frame 通过现有 FFI.onVideoFrameUpdate 推给 rust 端.
+     * 复用 ImageReader 模式, 只是源头不同 (MediaExtractor vs MediaProjection).
+     */
+    private fun startMdmScreenrecordCapture(): Boolean {
+        try {
+            val screenFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen.h264")
+            if (!screenFile.exists() || screenFile.length() < 1024) {
+                Log.w(logTag, "mdm screenrecord file not ready")
+                return false
+            }
+
+            // 1. MediaExtractor 设数据源
+            mdmExtractor = MediaExtractor().apply {
+                setDataSource(screenFile.absolutePath)
+            }
+            var trackIndex = -1
+            for (i in 0 until mdmExtractor!!.trackCount) {
+                val format = mdmExtractor!!.getTrackFormat(i)
+                if ((format.getString(MediaFormat.KEY_MIME) ?: "").startsWith("video/")) {
+                    trackIndex = i
+                    break
+                }
+            }
+            if (trackIndex < 0) {
+                Log.w(logTag, "mdm: no video track")
+                stopMdmScreenrecordCapture()
+                return false
+            }
+            mdmExtractor!!.selectTrack(trackIndex)
+            val trackFormat = mdmExtractor!!.getTrackFormat(trackIndex)
+            val mime = trackFormat.getString(MediaFormat.KEY_MIME) ?: "video/avc"
+
+            // 2. ImageReader: 解码器输出到 → surface → onImageAvailable → FFI.onVideoFrameUpdate
+            val frameWidth = trackFormat.getInteger(MediaFormat.KEY_WIDTH, SCREEN_INFO.width)
+            val frameHeight = trackFormat.getInteger(MediaFormat.KEY_HEIGHT, SCREEN_INFO.height)
+            mdmReader = ImageReader.newInstance(frameWidth, frameHeight, PixelFormat.RGBA_8888, 2)
+            mdmReader!!.setOnImageAvailableListener({ reader ->
+                try {
+                    reader.acquireLatestImage()?.use { image ->
+                        if (!isStart) return@use
+                        val buffer = image.planes[0].buffer
+                        buffer.rewind()
+                        val byteCount = buffer.remaining()
+                        FFI.onVideoFrameUpdate(buffer)
+                        recordCaptureFrame(byteCount)
+                    }
+                } catch (e: Exception) {
+                    recordCaptureError(e)
+                }
+            }, serviceHandler)
+
+            // 3. MediaCodec 解码器 → ImageReader surface
+            mdmDecoder = MediaCodec.createDecoderByType(mime)
+            mdmDecoder!!.configure(trackFormat, mdmReader!!.surface, null, 0)
+            mdmDecoder!!.start()
+
+            // 4. 后台线程: 从 extractor 喂数据到 decoder input buffer
+            Thread({
+                val inputBuffers = mdmDecoder!!.inputBuffers
+                while (isStart && mdmExtractor != null) {
+                    try {
+                        val inIdx = mdmDecoder!!.dequeueInputBuffer(5000)
+                        if (inIdx >= 0) {
+                            val inBuf = inputBuffers[inIdx] ?: continue
+                            val sampleSize = mdmExtractor!!.readSampleData(inBuf, 0)
+                            if (sampleSize > 0) {
+                                mdmDecoder!!.queueInputBuffer(inIdx, 0, sampleSize, mdmExtractor!!.sampleTime, 0)
+                                mdmExtractor!!.advance()
+                            } else {
+                                mdmExtractor!!.advance()
+                            }
+                        }
+                    } catch (e: Throwable) {
+                        if (isStart) {
+                            Log.w(logTag, "mdm feed error: ${e.message}")
+                            Thread.sleep(100)
+                        }
+                    }
+                }
+            }, "mdm-screenrecord-feed").start()
+
+            _isStart = true
+            resetCaptureStats()
+            Log.i(logTag, "mdm screenrecord capture started: ${screenFile.absolutePath}")
+            return true
+        } catch (e: Throwable) {
+            Log.e(logTag, "mdm screenrecord capture failed: ${e.message}", e)
+            stopMdmScreenrecordCapture()
+            return false
+        }
+    }
+
+    /**
+     * 释放 mdm screenrecord 视频读取相关资源.
+     */
+    private fun stopMdmScreenrecordCapture() {
+        try {
+            mdmDecoder?.stop()
+        } catch (e: Throwable) { Log.w(logTag, "mdm decoder stop: ${e.message}") }
+        mdmDecoder?.release()
+        mdmReader?.close()
+        mdmReader = null
+        mdmDecoder = null
+        mdmExtractor?.release()
+        mdmExtractor = null
+        Log.i(logTag, "mdm screenrecord capture released")
+    }
+
 }
