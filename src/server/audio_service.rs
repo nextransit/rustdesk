@@ -240,8 +240,12 @@ mod pa_impl {
                     // Cap silence pad at 50 frames (1s) after the last raw
                     // frame; afterwards sleep 100ms so we do not starve the
                     // video encoder on devices that never deliver raw PCM.
+                    // P1(mdm-noise-floor): use true 0.0 instead of 1.0e-7.
+                    // Opus would otherwise emit a non-DTX packet; the client
+                    // decoder turns that into persistent hiss whenever the
+                    // audio is "enabled" but no real PCM is arriving.
                     if stats.missed_frames <= 50 {
-                        let filler: Vec<f32> = vec![1.0e-7; target_frame_floats];
+                        let filler: Vec<f32> = vec![0.0; target_frame_floats];
                         let sent = send_f32(&filler, &mut encoder, &sp);
                         if sent > 0 {
                             stats.opus_sent(sent);
