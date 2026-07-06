@@ -61,6 +61,8 @@ const val TOUCH_PAN_END = 6
 const val WHEEL_STEP = 120
 const val WHEEL_DURATION = 50L
 const val LONG_TAP_DELAY = 200L
+private const val TAP_GESTURE_MAX_DURATION_MS = 80L
+private const val TAP_GESTURE_MOVE_THRESHOLD = 8
 
 class InputService : AccessibilityService() {
 
@@ -85,6 +87,10 @@ class InputService : AccessibilityService() {
 
     private var lastX = 0
     private var lastY = 0
+    private var gestureStartX = 0
+    private var gestureStartY = 0
+    private var gestureMoved = false
+    private var gestureContinued = false
 
     private val volumeController: VolumeController by lazy { VolumeController(applicationContext.getSystemService(AUDIO_SERVICE) as AudioManager) }
 
@@ -381,6 +387,10 @@ class InputService : AccessibilityService() {
         lastTouchGestureStartTime = System.currentTimeMillis()
         lastX = x
         lastY = y
+        gestureStartX = x
+        gestureStartY = y
+        gestureMoved = false
+        gestureContinued = false
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
@@ -389,6 +399,9 @@ class InputService : AccessibilityService() {
         var duration = System.currentTimeMillis() - lastTouchGestureStartTime
         if (duration <= 0) {
             duration = 1
+        }
+        if (shouldCapTapDuration(x, y, willContinue)) {
+            duration = duration.coerceAtMost(TAP_GESTURE_MAX_DURATION_MS)
         }
         try {
             if (stroke == null) {
@@ -465,6 +478,10 @@ class InputService : AccessibilityService() {
 
     @RequiresApi(Build.VERSION_CODES.N)
     private fun continueGesture(x: Int, y: Int) {
+        if (abs(x - gestureStartX) + abs(y - gestureStartY) > TAP_GESTURE_MOVE_THRESHOLD) {
+            gestureMoved = true
+        }
+        gestureContinued = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             doDispatchGesture(x, y, true)
             touchPath.reset()
@@ -485,6 +502,9 @@ class InputService : AccessibilityService() {
             if (duration <= 0) {
                 duration = 1
             }
+            if (shouldCapTapDuration(x, y, false)) {
+                duration = duration.coerceAtMost(TAP_GESTURE_MAX_DURATION_MS)
+            }
             val stroke = GestureDescription.StrokeDescription(
                 touchPath,
                 0,
@@ -497,6 +517,13 @@ class InputService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e(logTag, "endGesture error:$e")
         }
+    }
+
+    private fun shouldCapTapDuration(x: Int, y: Int, willContinue: Boolean): Boolean {
+        if (willContinue || gestureContinued || gestureMoved) {
+            return false
+        }
+        return abs(x - gestureStartX) + abs(y - gestureStartY) <= TAP_GESTURE_MOVE_THRESHOLD
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
