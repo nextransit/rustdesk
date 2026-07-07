@@ -23,6 +23,7 @@ const val AUDIO_SAMPLE_RATE = 48000
 const val AUDIO_OUTPUT_CHANNELS = 2
 private const val AUDIO_BYTES_PER_SAMPLE = 4
 private const val AUDIO_FRAMES_PER_OPUS_BATCH = 480
+private const val AUDIO_NOISE_GATE_THRESHOLD = 0.0035f
 
 class AudioRecordHandle(private var context: Context, private var isVideoStart: ()->Boolean, private var isAudioStart: ()->Boolean) {
     private val logTag = "LOG_AUDIO_RECORD_HANDLE"
@@ -40,6 +41,7 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     private var audioMaxAbsObserved = 0f
     private var lastAudioMaxAbs = 0f
     private var lastAudioStatsLogAt = 0L
+    private var audioNoiseGateSilencedFrames = 0L
 
     @SuppressLint("MissingPermission", "NewApi")
     @RequiresApi(Build.VERSION_CODES.M)
@@ -187,6 +189,7 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                 audioByteCount = 0L
                 audioMaxAbsObserved = 0f
                 lastAudioMaxAbs = 0f
+                audioNoiseGateSilencedFrames = 0L
                 lastAudioStatsLogAt = System.currentTimeMillis()
                 Log.i(
                     logTag,
@@ -203,7 +206,9 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                     while (audioRecordStat) {
                         try {
                             audioReader!!.readSync(audioRecorder!!)?.let {
-                                recordAudioFrame(it)
+                                val frameMaxAbs = maxAbs(it)
+                                val noiseGated = applyNoiseGate(it, frameMaxAbs)
+                                recordAudioFrame(it, frameMaxAbs, noiseGated)
                                 FFI.onAudioFrameUpdate(it)
                             }
                             consecutiveErrors = 0
@@ -227,7 +232,8 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                     Log.i(
                         logTag,
                 "MDM-AudioRecorderStop mode=$recorderMode source=$recorderSource " +
-                            "frames=$audioFrameCount bytes=$audioByteCount max_abs=$audioMaxAbsObserved"
+                            "frames=$audioFrameCount bytes=$audioByteCount max_abs=$audioMaxAbsObserved " +
+                            "noise_gate_silenced_frames=$audioNoiseGateSilencedFrames"
                     )
                 }
                 return true
@@ -355,12 +361,15 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
         return normalizedFrames * inputFrameBytes
     }
 
-    private fun recordAudioFrame(buffer: ByteBuffer) {
+    private fun recordAudioFrame(buffer: ByteBuffer, frameMaxAbs: Float, noiseGated: Boolean) {
         val bytes = buffer.capacity()
         val frames = ++audioFrameCount
         audioByteCount += bytes.toLong().coerceAtLeast(0L)
-        lastAudioMaxAbs = maxAbs(buffer)
-        audioMaxAbsObserved = max(audioMaxAbsObserved, lastAudioMaxAbs)
+        if (noiseGated) {
+            audioNoiseGateSilencedFrames += 1
+        }
+        lastAudioMaxAbs = if (noiseGated) 0f else frameMaxAbs
+        audioMaxAbsObserved = max(audioMaxAbsObserved, frameMaxAbs)
         val now = System.currentTimeMillis()
         if (frames == 1L || now - lastAudioStatsLogAt >= 5000L) {
             lastAudioStatsLogAt = now
@@ -368,9 +377,26 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                 logTag,
                 "MDM-AudioFrameStats mode=$recorderMode source=$recorderSource " +
                     "frames=$frames bytes=$audioByteCount last_frame_bytes=$bytes " +
-                    "last_max_abs=$lastAudioMaxAbs max_abs=$audioMaxAbsObserved"
+                    "last_max_abs=$lastAudioMaxAbs raw_last_max_abs=$frameMaxAbs max_abs=$audioMaxAbsObserved " +
+                    "noise_gate=$noiseGated noise_gate_threshold=$AUDIO_NOISE_GATE_THRESHOLD " +
+                    "noise_gate_silenced_frames=$audioNoiseGateSilencedFrames"
             )
         }
+    }
+
+    private fun applyNoiseGate(buffer: ByteBuffer, frameMaxAbs: Float): Boolean {
+        if (recorderMode == "playback_capture") {
+            return false
+        }
+        if (frameMaxAbs >= AUDIO_NOISE_GATE_THRESHOLD) {
+            return false
+        }
+        val writer = buffer.duplicate().order(ByteOrder.nativeOrder())
+        writer.rewind()
+        while (writer.remaining() >= AUDIO_BYTES_PER_SAMPLE) {
+            writer.putFloat(0f)
+        }
+        return true
     }
 
     private fun maxAbs(buffer: ByteBuffer): Float {
