@@ -23,7 +23,7 @@ const val AUDIO_SAMPLE_RATE = 48000
 const val AUDIO_OUTPUT_CHANNELS = 2
 private const val AUDIO_BYTES_PER_SAMPLE = 4
 private const val AUDIO_FRAMES_PER_OPUS_BATCH = 480
-private const val AUDIO_NOISE_GATE_THRESHOLD = 0.0035f
+private const val AUDIO_NOISE_GATE_THRESHOLD = 0.0002f
 
 class AudioRecordHandle(private var context: Context, private var isVideoStart: ()->Boolean, private var isAudioStart: ()->Boolean) {
     private val logTag = "LOG_AUDIO_RECORD_HANDLE"

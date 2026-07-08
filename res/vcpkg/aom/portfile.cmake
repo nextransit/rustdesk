@@ -19,10 +19,13 @@ if(DEFINED ENV{USE_AOM_391})
             aom-install.diff
     )
 else()
-    vcpkg_from_git(
-        OUT_SOURCE_PATH SOURCE_PATH
-        URL "https://aomedia.googlesource.com/aom"
-        REF 10aece4157eb79315da205f39e19bf6ab3ee30d0 # 3.12.1
+    vcpkg_download_distfile(ARCHIVE
+        URLS "https://storage.googleapis.com/aom-releases/libaom-3.12.1.tar.gz"
+        FILENAME "libaom-3.12.1.tar.gz"
+        SHA512 27521fe1cffd89a8875552f1758de89c19a47aa1640ee20930ac420a03d964eb9ae10c4b0f55e518c37d4d59f06657aee2bfa84eedad35683648bd658e06da73
+    )
+    vcpkg_extract_source_archive(SOURCE_PATH
+        ARCHIVE "${ARCHIVE}"
         PATCHES
             aom-uninitialized-pointer.diff
             # aom-avx2.diff
