@@ -121,10 +121,11 @@ class MainService : Service() {
     fun rustGetByName(name: String): String {
         return when (name) {
             "screen_size" -> {
+                val screenSize = currentScreenSizeForRustDesk()
                 JSONObject().apply {
-                    put("width",captureWidth)
-                    put("height",captureHeight)
-                    put("scale",SCREEN_INFO.scale)
+                    put("width", screenSize.first)
+                    put("height", screenSize.second)
+                    put("scale", screenSize.third)
                 }.toString()
             }
             "is_start" -> {
@@ -427,6 +428,16 @@ class MainService : Service() {
         fun applyMdmAudioEnabled(enabled: Boolean): Boolean {
             return activeInstance?.applyMdmAudioEnabledNow(enabled) ?: false
         }
+    }
+
+    private fun currentScreenSizeForRustDesk(): Triple<Int, Int, Int> {
+        if (captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD && mdmCaptureWidth > 0 && mdmCaptureHeight > 0) {
+            return Triple(mdmCaptureWidth, mdmCaptureHeight, SCREEN_INFO.scale)
+        }
+        readMdmScreenrecordMetaIfRunning()?.let { meta ->
+            return Triple(meta.first, meta.second, SCREEN_INFO.scale)
+        }
+        return Triple(SCREEN_INFO.width, SCREEN_INFO.height, SCREEN_INFO.scale)
     }
 
     private val logTag = "LOG_SERVICE"
@@ -1356,6 +1367,7 @@ class MainService : Service() {
             captureSourceValue = CAPTURE_SOURCE_MDM_SCREENRECORD
             mdmCaptureWidth = frameWidth
             mdmCaptureHeight = frameHeight
+            FFI.refreshScreen()
             resetCaptureStats()
             MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
             FFI.setFrameRawEnable("video", true)
@@ -1377,15 +1389,40 @@ class MainService : Service() {
     }
 
     private fun readMdmScreenrecordMeta(): Pair<Int, Int> {
+        return readMdmScreenrecordMetaFromFile(logFailure = true)
+            ?: Pair(SCREEN_INFO.width, SCREEN_INFO.height)
+    }
+
+    private fun readMdmScreenrecordMetaIfRunning(): Pair<Int, Int>? {
+        return if (isMdmScreenrecordProcessRunning()) {
+            readMdmScreenrecordMetaFromFile(logFailure = false)
+        } else {
+            null
+        }
+    }
+
+    private fun readMdmScreenrecordMetaFromFile(logFailure: Boolean): Pair<Int, Int>? {
         return try {
             val metaFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen_meta.json")
+            if (!metaFile.exists()) return null
             val json = JSONObject(metaFile.readText())
             val frameWidth = json.optInt("width", SCREEN_INFO.width).coerceAtLeast(1)
             val frameHeight = json.optInt("height", SCREEN_INFO.height).coerceAtLeast(1)
             Pair(frameWidth, frameHeight)
         } catch (e: Throwable) {
-            Log.w(logTag, "mdm screenrecord meta read failed: ${e.message}")
-            Pair(SCREEN_INFO.width, SCREEN_INFO.height)
+            if (logFailure) {
+                Log.w(logTag, "mdm screenrecord meta read failed: ${e.message}")
+            }
+            null
+        }
+    }
+
+    private fun isMdmScreenrecordProcessRunning(): Boolean {
+        return try {
+            val proc = Runtime.getRuntime().exec(arrayOf("pidof", "screenrecord"))
+            proc.waitFor() == 0
+        } catch (_: Throwable) {
+            false
         }
     }
 

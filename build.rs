@@ -78,6 +78,8 @@ fn install_android_deps() {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
+    println!("cargo:rerun-if-env-changed=VCPKG_INSTALLED_ROOT");
     hbb_common::gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]

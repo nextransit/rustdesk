@@ -227,6 +227,9 @@ fn ffmpeg() {
 */
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
+    println!("cargo:rerun-if-env-changed=VCPKG_INSTALLED_ROOT");
+
     // in this crate, these are also valid configurations
     println!("cargo:rustc-check-cfg=cfg(dxgi,quartz,x11)");
 

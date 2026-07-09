@@ -1,9 +1,12 @@
-vcpkg_from_github(
-    OUT_SOURCE_PATH SOURCE_PATH
-    REPO ffmpeg/ffmpeg
-    REF "n${VERSION}"
-    SHA512 3b273769ef1a1b63aed0691eef317a760f8c83b1d0e1c232b67bbee26db60b4864aafbc88df0e86d6bebf07185bbd057f33e2d5258fde6d97763b9994cd48b6f
-    HEAD_REF master
+vcpkg_download_distfile(ARCHIVE
+    URLS
+        "https://ftp.osuosl.org/pub/blfs/conglomeration/ffmpeg/ffmpeg-${VERSION}.tar.xz"
+        "https://www.ffmpeg.org/releases/ffmpeg-${VERSION}.tar.xz"
+    FILENAME "ffmpeg-${VERSION}.tar.xz"
+    SHA512 7282fff068452bf154b2bf814e7f20d44ed4d961687dffd841bd77b88f26d9eee2cf4cf02e9a60b48b50e77a0c34731580d9e7c0945e3bc14c8ace840d920cde
+)
+vcpkg_extract_source_archive(SOURCE_PATH
+    ARCHIVE "${ARCHIVE}"
     PATCHES
     0001-create-lib-libraries.patch
     0002-fix-msvc-link.patch

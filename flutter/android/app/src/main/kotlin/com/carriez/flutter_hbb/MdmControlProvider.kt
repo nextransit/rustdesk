@@ -32,6 +32,7 @@ class MdmControlProvider : ContentProvider() {
                 METHOD_CLEAR_SESSION_PASSWORD -> clearSessionPassword()
                 METHOD_START_SERVICE -> startService(extras)
                 METHOD_REQUEST_MEDIA_PROJECTION -> requestMediaProjection()
+                METHOD_SWITCH_MDM_SCREENRECORD -> switchMdmScreenrecord(extras)
                 METHOD_STOP_SERVICE -> stopService()
                 METHOD_SERVICE_STATUS -> serviceStatus()
                 METHOD_GET_IDENTITY -> getIdentity()
@@ -180,11 +181,15 @@ class MdmControlProvider : ContentProvider() {
             putBoolean(KEY_SUCCESS, false); putString(KEY_ERROR, "no context")
         }
         if (MainService.isCapturing) {
+            if (MainService.captureSource != CAPTURE_SOURCE_MDM_SCREENRECORD) {
+                MainService.switchToMdmSystemScreenrecord("request_media_projection_already_capturing")
+            }
             return Bundle().apply {
                 putBoolean(KEY_SUCCESS, true)
                 putString(KEY_PATH, "MediaProjection already capturing")
                 putBoolean(KEY_STATUS_CAPTURING, true)
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+                putString(KEY_STATUS_CAPTURE_SOURCE, MainService.captureSource)
             }
         }
         if (MainService.mediaProjectionRequestInFlight) {
@@ -193,6 +198,7 @@ class MdmControlProvider : ContentProvider() {
                 putString(KEY_PATH, "MediaProjection request already in flight")
                 putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+                putString(KEY_STATUS_CAPTURE_SOURCE, MainService.captureSource)
             }
         }
         ctx.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
@@ -220,6 +226,7 @@ class MdmControlProvider : ContentProvider() {
                 putString(KEY_PATH, "MediaProjection request dispatched")
                 putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
                 putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+                putString(KEY_STATUS_CAPTURE_SOURCE, MainService.captureSource)
             }
         } catch (e: Exception) {
             MainService.clearMediaProjectionRequest("mdm_provider_failed")
@@ -227,6 +234,22 @@ class MdmControlProvider : ContentProvider() {
             Bundle().apply {
                 putBoolean(KEY_SUCCESS, false)
                 putString(KEY_ERROR, "requestMediaProjection: ${e.message}")
+            }
+        }
+    }
+
+    private fun switchMdmScreenrecord(extras: Bundle?): Bundle {
+        val forceRestart = extras?.getBoolean(KEY_FORCE_CAPTURE_RESTART, false) == true
+        val ok = MainService.switchToMdmSystemScreenrecord("provider", forceRestart)
+        return Bundle().apply {
+            putBoolean(KEY_SUCCESS, ok)
+            putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
+            putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+            putString(KEY_STATUS_CAPTURE_SOURCE, MainService.captureSource)
+            if (ok) {
+                putString(KEY_PATH, "switched to mdm screenrecord")
+            } else {
+                putString(KEY_ERROR, "mdm screenrecord source not ready")
             }
         }
     }
@@ -293,10 +316,11 @@ class MdmControlProvider : ContentProvider() {
                 putLong(KEY_STATUS_CAPTURE_LAST_FRAME_AGE_MS, MainService.captureLastFrameAgeMs)
                 putLong(KEY_STATUS_CAPTURE_DURATION_MS, MainService.captureDurationMs)
                 putDouble(KEY_STATUS_CAPTURE_AVG_FPS, MainService.captureAverageFps)
-                putInt(KEY_STATUS_CAPTURE_WIDTH, SCREEN_INFO.width)
-                putInt(KEY_STATUS_CAPTURE_HEIGHT, SCREEN_INFO.height)
+                putInt(KEY_STATUS_CAPTURE_WIDTH, MainService.captureWidth)
+                putInt(KEY_STATUS_CAPTURE_HEIGHT, MainService.captureHeight)
                 putInt(KEY_STATUS_CAPTURE_SCALE, SCREEN_INFO.scale)
                 putInt(KEY_STATUS_CAPTURE_DPI, SCREEN_INFO.dpi)
+                putString(KEY_STATUS_CAPTURE_SOURCE, MainService.captureSource)
                 MainService.captureLastErrorMessage?.let {
                     putString(KEY_STATUS_CAPTURE_LAST_ERROR, it)
                 }
@@ -474,6 +498,7 @@ class MdmControlProvider : ContentProvider() {
         private const val METHOD_CLEAR_SESSION_PASSWORD = "clear_session_password"
         private const val METHOD_START_SERVICE = "start_service"
         private const val METHOD_REQUEST_MEDIA_PROJECTION = "request_media_projection"
+        private const val METHOD_SWITCH_MDM_SCREENRECORD = "switch_mdm_screenrecord"
         private const val METHOD_STOP_SERVICE = "stop_service"
         private const val METHOD_SERVICE_STATUS = "service_status"
         private const val METHOD_GET_IDENTITY = "get_identity"
@@ -508,8 +533,11 @@ class MdmControlProvider : ContentProvider() {
         private const val KEY_STATUS_CAPTURE_HEIGHT = "capture_height"
         private const val KEY_STATUS_CAPTURE_SCALE = "capture_scale"
         private const val KEY_STATUS_CAPTURE_DPI = "capture_dpi"
+        private const val KEY_STATUS_CAPTURE_SOURCE = "capture_source"
         private const val KEY_STATUS_CAPTURE_LAST_ERROR = "capture_last_error"
+        private const val KEY_FORCE_CAPTURE_RESTART = "force_capture_restart"
         private const val KEY_RUSTDESK_ID = "rustdesk_id"
+        private const val CAPTURE_SOURCE_MDM_SCREENRECORD = "mdm_screenrecord"
 
         // mdm-agent 拉起 service 的 action (无 mediaProjection, 用于纯后台驻留)
         // 与 ACT_INIT_MEDIA_PROJECTION_AND_SERVICE 区别: 不弹投屏确认, 不需要 mediaProjection intent

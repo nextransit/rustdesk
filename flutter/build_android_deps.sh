@@ -66,12 +66,6 @@ function build {
 
 	  echo "*** [$ANDROID_ABI][Start] Build and install vcpkg dependencies"
 	  pushd "$SCRIPTDIR/.."
-	  if [ "$VCPKG_TARGET" = "arm-neon-android" ] &&
-	     [ ! -d "$VCPKG_ROOT/installed/arm-neon-android" ] &&
-	     [ -d "$VCPKG_ROOT/installed/arm-android" ]; then
-	    echo "*** [Repair] Restore arm-neon-android from legacy arm-android directory"
-	    cp -a "$VCPKG_ROOT/installed/arm-android" "$VCPKG_ROOT/installed/arm-neon-android"
-	  fi
 	  $VCPKG_ROOT/vcpkg install --triplet $VCPKG_TARGET --x-install-root="$VCPKG_ROOT/installed"
 	  if [ "$VCPKG_TARGET" = "arm-neon-android" ] &&
 	     [ -d "$VCPKG_ROOT/installed/arm-neon-android" ]; then
