@@ -12,6 +12,8 @@ import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
 import android.os.Build
 import android.util.Log
+import java.io.File
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.concurrent.thread
@@ -24,6 +26,10 @@ const val AUDIO_OUTPUT_CHANNELS = 2
 private const val AUDIO_BYTES_PER_SAMPLE = 4
 private const val AUDIO_FRAMES_PER_OPUS_BATCH = 480
 private const val AUDIO_NOISE_GATE_THRESHOLD = 0.0002f
+private const val SYSTEM_AUDIO_FRAME_BYTES = AUDIO_SAMPLE_RATE * AUDIO_OUTPUT_CHANNELS * 2 / 50
+private const val SYSTEM_AUDIO_MAX_BACKLOG_BYTES = SYSTEM_AUDIO_FRAME_BYTES * 10L
+private const val SYSTEM_AUDIO_PATH =
+    "/sdcard/Android/data/com.decard.mdm.agent/files/system_audio.pcm"
 
 class AudioRecordHandle(private var context: Context, private var isVideoStart: ()->Boolean, private var isAudioStart: ()->Boolean) {
     private val logTag = "LOG_AUDIO_RECORD_HANDLE"
@@ -42,6 +48,7 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     private var lastAudioMaxAbs = 0f
     private var lastAudioStatsLogAt = 0L
     private var audioNoiseGateSilencedFrames = 0L
+    private var systemAudioFileMode = false
 
     @SuppressLint("MissingPermission", "NewApi")
     @RequiresApi(Build.VERSION_CODES.M)
@@ -66,6 +73,11 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
         }
         audioReader = null
         minBufferSize = 0
+        systemAudioFileMode = false
+
+        if (!inVoiceCall && mediaProjection == null && configureSystemPlaybackFile()) {
+            return true
+        }
 
         val requests = mutableListOf<AudioRecorderRequest>()
         if (inVoiceCall) {
@@ -82,16 +94,6 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                     sourceLabel = "AudioPlaybackCaptureConfiguration"
                 )
             }
-            requests += AudioRecorderRequest(
-                mode = "mic_fallback",
-                source = MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                sourceLabel = "VOICE_COMMUNICATION"
-            )
-            requests += AudioRecorderRequest(
-                mode = "mic_fallback",
-                source = MediaRecorder.AudioSource.MIC,
-                sourceLabel = "MIC"
-            )
         }
 
         for (request in requests) {
@@ -180,6 +182,9 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
 
     @RequiresApi(Build.VERSION_CODES.M)
     fun startAudioRecorder(): Boolean {
+        if (systemAudioFileMode) {
+            return startSystemPlaybackFileReader()
+        }
         if (audioReader != null && audioRecorder != null && minBufferSize != 0) {
             try {
                 FFI.setFrameRawEnable("audio", true)
@@ -325,6 +330,9 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                 Log.w(logTag, "MDM-AudioRecorderStop timeout mode=$recorderMode source=$recorderSource")
             } else {
                 audioThread = null
+                audioReader = null
+                minBufferSize = 0
+                systemAudioFileMode = false
             }
         } else if (thread == null) {
             runCatching { audioRecorder?.release() }
@@ -332,7 +340,121 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
             audioReader = null
             minBufferSize = 0
             FFI.setFrameRawEnable("audio", false)
+            systemAudioFileMode = false
         }
+    }
+
+    private fun configureSystemPlaybackFile(): Boolean {
+        val audioFile = File(SYSTEM_AUDIO_PATH)
+        val readyDeadline = System.currentTimeMillis() + 2_000L
+        while (System.currentTimeMillis() < readyDeadline &&
+            (!audioFile.exists() || audioFile.length() < SYSTEM_AUDIO_FRAME_BYTES)
+        ) {
+            Thread.sleep(20L)
+        }
+        if (!audioFile.exists()) {
+            Log.w(logTag, "MDM-AudioPlaybackUnavailable reason=system_audio_file_missing")
+            return false
+        }
+        recorderMode = "system_playback_file"
+        recorderSource = "REMOTE_SUBMIX"
+        inputChannelCount = AUDIO_OUTPUT_CHANNELS
+        minBufferSize = SYSTEM_AUDIO_FRAME_BYTES
+        systemAudioFileMode = true
+        Log.i(
+            logTag,
+            "MDM-AudioRecorderCreated mode=$recorderMode source=$recorderSource sdk=${Build.VERSION.SDK_INT} " +
+                "sample_rate=$AUDIO_SAMPLE_RATE input_channels=$inputChannelCount " +
+                "output_channels=$AUDIO_OUTPUT_CHANNELS encoding=PCM_S16LE frame_bytes=$SYSTEM_AUDIO_FRAME_BYTES"
+        )
+        return true
+    }
+
+    private fun startSystemPlaybackFileReader(): Boolean {
+        val audioFile = File(SYSTEM_AUDIO_PATH)
+        if (!audioFile.exists()) {
+            Log.w(logTag, "MDM-AudioRecorderStartFailed mode=$recorderMode reason=system_audio_file_missing")
+            return false
+        }
+        FFI.setFrameRawEnable("audio", true)
+        audioRecordStat = true
+        audioFrameCount = 0L
+        audioByteCount = 0L
+        audioMaxAbsObserved = 0f
+        lastAudioMaxAbs = 0f
+        audioNoiseGateSilencedFrames = 0L
+        lastAudioStatsLogAt = System.currentTimeMillis()
+        Log.i(
+            logTag,
+            "MDM-AudioRecorderStart mode=$recorderMode source=$recorderSource sdk=${Build.VERSION.SDK_INT} " +
+                "buffer_bytes=$SYSTEM_AUDIO_FRAME_BYTES input_channels=$inputChannelCount " +
+                "output_channels=$AUDIO_OUTPUT_CHANNELS"
+        )
+        audioThread = thread(name = "mdm-system-audio-reader") {
+            var stream: RandomAccessFile? = null
+            var offset = 0L
+            val pcmBytes = ByteArray(SYSTEM_AUDIO_FRAME_BYTES)
+            val pcmReader = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN)
+            val floatBuffer = ByteBuffer
+                .allocateDirect(SYSTEM_AUDIO_FRAME_BYTES * 2)
+                .order(ByteOrder.nativeOrder())
+            try {
+                while (audioRecordStat) {
+                    if (!audioFile.exists()) {
+                        Thread.sleep(20L)
+                        continue
+                    }
+                    val length = audioFile.length()
+                    if (stream == null || length < offset) {
+                        runCatching { stream?.close() }
+                        stream = RandomAccessFile(audioFile, "r")
+                        offset = if (length >= SYSTEM_AUDIO_FRAME_BYTES) {
+                            length - length % SYSTEM_AUDIO_FRAME_BYTES
+                        } else {
+                            0L
+                        }
+                    }
+                    if (length - offset > SYSTEM_AUDIO_MAX_BACKLOG_BYTES) {
+                        offset = (length - SYSTEM_AUDIO_FRAME_BYTES * 2L)
+                            .coerceAtLeast(0L)
+                            .let { it - it % SYSTEM_AUDIO_FRAME_BYTES }
+                    }
+                    if (length - offset < SYSTEM_AUDIO_FRAME_BYTES) {
+                        Thread.sleep(5L)
+                        continue
+                    }
+                    val activeStream = stream ?: continue
+                    activeStream.seek(offset)
+                    activeStream.readFully(pcmBytes)
+                    offset += SYSTEM_AUDIO_FRAME_BYTES
+                    pcmReader.clear()
+                    floatBuffer.clear()
+                    var frameMaxAbs = 0f
+                    while (pcmReader.remaining() >= 2) {
+                        val sample = pcmReader.short.toFloat() / 32768f
+                        frameMaxAbs = max(frameMaxAbs, abs(sample))
+                        floatBuffer.putFloat(sample)
+                    }
+                    floatBuffer.flip()
+                    recordAudioFrame(floatBuffer, frameMaxAbs, false)
+                    FFI.onAudioFrameUpdate(floatBuffer)
+                }
+            } catch (error: Throwable) {
+                if (audioRecordStat) {
+                    Log.e(logTag, "MDM-AudioThreadError mode=$recorderMode err=$error")
+                }
+            } finally {
+                runCatching { stream?.close() }
+                FFI.setFrameRawEnable("audio", false)
+                systemAudioFileMode = false
+                Log.i(
+                    logTag,
+                    "MDM-AudioRecorderStop mode=$recorderMode source=$recorderSource " +
+                        "frames=$audioFrameCount bytes=$audioByteCount max_abs=$audioMaxAbsObserved"
+                )
+            }
+        }
+        return true
     }
 
     fun destroy() {

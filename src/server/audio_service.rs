@@ -691,6 +691,7 @@ const MAX_AUDIO_ZERO_COUNT: u16 = 800;
 static mut AUDIO_ZERO_COUNT: u16 = 0;
 
 fn send_f32(data: &[f32], encoder: &mut Encoder, sp: &GenericService) -> usize {
+    #[cfg(not(target_os = "android"))]
     if data.iter().filter(|x| **x != 0.).next().is_some() {
         unsafe {
             AUDIO_ZERO_COUNT = 0;

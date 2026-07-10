@@ -71,7 +71,13 @@ impl EncoderApi for VpxEncoder {
                 // When the data buffer falls below this percentage of fullness, a dropped frame is indicated. Set the threshold to zero (0) to disable this feature.
                 // In dynamic scenes, low bitrate gets low fps while high bitrate gets high fps.
                 c.rc_dropframe_thresh = 25;
-                c.g_threads = codec_thread_num(64) as _;
+                let mut encoder_threads = codec_thread_num(64);
+                #[cfg(target_os = "android")]
+                if config.codec == VpxVideoCodecId::VP8 {
+                    c.rc_dropframe_thresh = 0;
+                    encoder_threads = encoder_threads.max(2).min(num_cpus::get());
+                }
+                c.g_threads = encoder_threads as _;
                 c.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
                 // https://developers.google.com/media/vp9/bitrate-modes/
                 // Constant Bitrate mode (CBR) is recommended for live streaming with VP9.
@@ -88,6 +94,16 @@ impl EncoderApi for VpxEncoder {
                 c.rc_max_quantizer = q_max;
                 c.rc_target_bitrate =
                     Self::bitrate(config.width as _, config.height as _, config.quality);
+                log::warn!(
+                    "VPX encoder config: codec={:?}, size={}x{}, threads={}, dropframe_thresh={}, target_bitrate={}kbps, quality={:.2}",
+                    config.codec,
+                    config.width,
+                    config.height,
+                    c.g_threads,
+                    c.rc_dropframe_thresh,
+                    c.rc_target_bitrate,
+                    config.quality
+                );
                 // https://chromium.googlesource.com/webm/libvpx/+/refs/heads/main/vp9/common/vp9_enums.h#29
                 // https://chromium.googlesource.com/webm/libvpx/+/refs/heads/main/vp8/vp8_cx_iface.c#282
                 c.g_profile = if i444 && config.codec == VpxVideoCodecId::VP9 {
@@ -231,7 +247,12 @@ impl EncoderApi for VpxEncoder {
 }
 
 impl VpxEncoder {
-    pub fn encode<'a>(&'a mut self, pts: i64, data: &[u8], stride_align: usize) -> Result<EncodeFrames<'a>> {
+    pub fn encode<'a>(
+        &'a mut self,
+        pts: i64,
+        data: &[u8],
+        stride_align: usize,
+    ) -> Result<EncodeFrames<'a>> {
         let bpp = if self.i444 { 24 } else { 12 };
         if data.len() < self.width * self.height * bpp / 8 {
             return Err(Error::FailedCall("len not enough".to_string()));

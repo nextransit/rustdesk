@@ -58,7 +58,7 @@ lazy_static! {
 const MAX_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_AUDIO_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
 const RAW_FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+const FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(66);
 
 struct FrameRaw {
     name: &'static str,

@@ -243,14 +243,12 @@ impl Encoder {
             // set during mediacodec::MediaCodecDecoder::test() so we can use
             // Android MediaCodec H265 path when available.
             #[cfg(all(target_os = "android", feature = "mediacodec"))]
-            let h265_mediacodec_useable = H265_DECODER_SUPPORT
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let h265_mediacodec_useable =
+                H265_DECODER_SUPPORT.load(std::sync::atomic::Ordering::Relaxed);
             #[cfg(not(all(target_os = "android", feature = "mediacodec")))]
             let h265_mediacodec_useable = false;
             _all_support_h265_decoding
-                && (h265vram_encoding
-                    || h265hw_encoding.is_some()
-                    || h265_mediacodec_useable)
+                && (h265vram_encoding || h265hw_encoding.is_some() || h265_mediacodec_useable)
         };
         let mut format = ENCODE_CODEC_FORMAT.lock().unwrap();
         let preferences: Vec<_> = decodings
@@ -309,11 +307,11 @@ impl Encoder {
         #[cfg(target_os = "android")]
         let mut auto_codec = {
             if h265_useable {
-                CodecFormat::H265  // MediaCodec H265 硬件编码器
+                CodecFormat::H265 // MediaCodec H265 硬件编码器
             } else if h264_useable {
-                CodecFormat::H264  // MediaCodec H264 硬件编码器
+                CodecFormat::H264 // MediaCodec H264 硬件编码器
             } else if vp8_useable {
-                CodecFormat::VP8   // 纯软件兜底
+                CodecFormat::VP8 // 纯软件兜底
             } else {
                 CodecFormat::VP9
             }
@@ -353,7 +351,7 @@ impl Encoder {
         };
         *format = match preference {
             PreferCodec::VP8 => {
-                if vp8_useable {
+                if mdm_requested_preference || vp8_useable {
                     CodecFormat::VP8
                 } else {
                     auto_codec
@@ -394,12 +392,22 @@ impl Encoder {
             log::info!(
                 "usable: vp8={vp8_useable}, av1={av1_useable}, h264={h264_useable}, h265={h265_useable}",
             );
-            log::info!(
-                "connection count: {}, used preference: {:?}, encoder: {:?}",
-                decodings.len(),
-                preference,
-                *format
-            )
+            if mdm_requested_preference {
+                log::warn!(
+                    "MDM codec selection: connections={} preference={:?} encoder={:?} vp8_usable={}",
+                    decodings.len(),
+                    preference,
+                    *format,
+                    vp8_useable
+                );
+            } else {
+                log::info!(
+                    "connection count: {}, used preference: {:?}, encoder: {:?}",
+                    decodings.len(),
+                    preference,
+                    *format
+                );
+            }
         }
     }
 

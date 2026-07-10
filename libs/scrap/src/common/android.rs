@@ -77,6 +77,24 @@ impl Capturer {
 impl crate::TraitCapturer for Capturer {
     fn frame<'a>(&'a mut self, _timeout: Duration) -> io::Result<Frame<'a>> {
         if get_video_raw(&mut self.rgba, &mut self.saved_raw_data).is_some() {
+            if let Some((width, height, _)) = get_size() {
+                let expected_len = width as usize * height as usize * 4;
+                if self.rgba.len() == expected_len
+                    && (self.display.rect.w != width || self.display.rect.h != height)
+                {
+                    self.display.rect.w = width;
+                    self.display.rect.h = height;
+                    let mut screen_size = SCREEN_SIZE.lock().unwrap();
+                    let scale = screen_size.2;
+                    *screen_size = (width, height, scale);
+                    log::info!(
+                        "android capturer synchronized raw frame size to {}x{} bytes={}",
+                        width,
+                        height,
+                        self.rgba.len()
+                    );
+                }
+            }
             let scale = get_scale();
             if scale > 1.001 {
                 let orig_w = self.display.width() as usize;

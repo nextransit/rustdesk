@@ -22,6 +22,22 @@ object FFI {
     external fun setPermanentPassword(appDir: String, password: String): Boolean
     external fun clearPermanentPassword(appDir: String): Boolean
     external fun onVideoFrameUpdate(buf: ByteBuffer)
+    external fun convertYuv420ToRgba(
+        y: ByteBuffer,
+        u: ByteBuffer,
+        v: ByteBuffer,
+        output: ByteBuffer,
+        width: Int,
+        height: Int,
+        yPosition: Int,
+        uPosition: Int,
+        vPosition: Int,
+        yRowStride: Int,
+        uRowStride: Int,
+        vRowStride: Int,
+        uPixelStride: Int,
+        vPixelStride: Int
+    ): Boolean
     external fun onAudioFrameUpdate(buf: ByteBuffer)
     external fun translateLocale(localeName: String, input: String): String
     external fun refreshScreen()

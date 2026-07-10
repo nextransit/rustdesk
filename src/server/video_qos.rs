@@ -7,8 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MDM_MAX_FPS: &str = "mdm-max-fps";
-
 /*
 FPS adjust:
 a. new user connected =>set to INIT_FPS
@@ -37,6 +35,7 @@ pub const MIN_FPS: u32 = 1;
 pub const MIN_FPS_HALF: u32 = 1; // 0.5 FPS for extreme low-bandwidth (flag-controlled)
 pub const MAX_FPS: u32 = 120;
 pub const INIT_FPS: u32 = 15;
+pub const INTERACTIVE_FPS_FLOOR: u32 = 12;
 
 // Bus mode constants
 /// 公交车载初始帧率 (传统 15 FPS → 3 FPS, 首帧等待用户授权后瞬间跳升)
@@ -128,6 +127,7 @@ pub struct VideoQoS {
     adjust_ratio_instant: Instant,
     abr_config: bool,
     new_user_instant: Instant,
+    diagnostic_log_instant: Instant,
     /// true 时启用公交车载超低带宽模式:
     ///   - lower init_fps (3), lower max_fps (10), lower ratio floor (0.04)
     ///   - aggressive fps/ratio reduction at lower network delay threshold
@@ -146,6 +146,7 @@ impl Default for VideoQoS {
             adjust_ratio_instant: Instant::now(),
             abr_config: true,
             new_user_instant: Instant::now(),
+            diagnostic_log_instant: Instant::now(),
             bus_mode: false,
         }
     }
@@ -234,6 +235,12 @@ impl VideoQoS {
             self.fps = bus_init;
             self.ratio = BR_BUS_LOW;
         }
+        log::warn!(
+            "MDM-QoS connection_open id={} bus_mode={} fps={}",
+            id,
+            self.bus_mode,
+            self.fps
+        );
     }
 
     // Clean up user session
@@ -250,6 +257,7 @@ impl VideoQoS {
         }
         if let Some(user) = self.users.get_mut(&id) {
             user.custom_fps = Some(fps);
+            log::warn!("MDM-QoS custom_fps id={} fps={}", id, fps);
         }
     }
 
@@ -259,6 +267,7 @@ impl VideoQoS {
         }
         if let Some(user) = self.users.get_mut(&id) {
             user.auto_adjust_fps = Some(fps);
+            log::warn!("MDM-QoS auto_adjust_fps id={} fps={}", id, fps);
         }
     }
 
@@ -293,10 +302,11 @@ impl VideoQoS {
     pub fn user_network_delay(&mut self, id: i32, delay: u32) {
         let highest_fps = self.highest_fps();
         let target_ratio = self.latest_quality().ratio();
+        let mut diagnostic: Option<(u32, u32, u32)> = None;
 
         // 公交车载模式: 使用更低的 min_fps/normal_fps
         let (min_fps, normal_fps) = if self.bus_mode {
-            (1, 3)     // bus: min=1 FPS, normal=3 FPS
+            (1, 3) // bus: min=1 FPS, normal=3 FPS
         } else if target_ratio >= BR_BEST {
             (8, 16)
         } else if target_ratio >= BR_BALANCED {
@@ -349,18 +359,19 @@ impl VideoQoS {
             } else if avg_delay < delay_threshold {
                 fps = min_fps.max(fps);
             } else {
-                let devide_fps = ((fps as f32) / (avg_delay as f32 / delay_threshold as f32))
-                    .ceil() as u32;
+                let devide_fps =
+                    ((fps as f32) / (avg_delay as f32 / delay_threshold as f32)).ceil() as u32;
                 if avg_delay < delay_threshold * 4 / 3 {
                     fps = min_fps.max(devide_fps);
                 } else if avg_delay < delay_threshold * 2 {
-                    fps = min_fps.min(devide_fps);
+                    fps = min_fps.max(devide_fps);
                 } else if avg_delay < delay_threshold * 4 {
                     fps = dividend_ms / avg_delay;
                 } else {
                     fps = (dividend_ms / avg_delay).min(devide_fps);
                 }
             }
+            fps = fps.max(min_fps.min(highest_fps));
 
             if avg_delay < delay_threshold {
                 user.delay.increase_fps_count += 1;
@@ -378,12 +389,31 @@ impl VideoQoS {
                 user.delay.quick_increase_fps_count = 0;
             }
 
-            fps = fps.clamp(MIN_FPS, highest_fps.min(mdm_max_fps()));
+            fps = fps.clamp(MIN_FPS, highest_fps);
             // first network delay message
             adjust_ratio = user.delay.fps.is_none();
             user.delay.fps = Some(fps);
+            diagnostic = Some((delay, avg_delay, fps));
         }
+        let old_fps = self.fps;
         self.adjust_fps();
+        if let Some((delay, avg_delay, calculated_fps)) = diagnostic {
+            if old_fps != self.fps
+                || self.diagnostic_log_instant.elapsed() >= Duration::from_secs(1)
+            {
+                log::warn!(
+                    "MDM-QoS network_delay id={} sample_ms={} avg_ms={} calculated_fps={} old_fps={} final_fps={} highest_fps={}",
+                    id,
+                    delay,
+                    avg_delay,
+                    calculated_fps,
+                    old_fps,
+                    self.fps,
+                    highest_fps
+                );
+                self.diagnostic_log_instant = Instant::now();
+            }
+        }
         if adjust_ratio && !cfg!(target_os = "linux") {
             //Reduce the possibility of vaapi being created twice
             self.adjust_ratio(false);
@@ -439,8 +469,14 @@ impl VideoQoS {
         let user_fps = |u: &UserData| {
             let mut fps = u.custom_fps.unwrap_or(FPS);
             if let Some(auto_adjust_fps) = u.auto_adjust_fps {
-                if fps == 0 || auto_adjust_fps < fps {
-                    fps = auto_adjust_fps;
+                let auto_adjust_floor = if self.bus_mode {
+                    MIN_FPS
+                } else {
+                    fps.min(INTERACTIVE_FPS_FLOOR)
+                };
+                let bounded_auto_adjust_fps = auto_adjust_fps.max(auto_adjust_floor);
+                if fps == 0 || bounded_auto_adjust_fps < fps {
+                    fps = bounded_auto_adjust_fps;
                 }
             }
             fps
@@ -454,7 +490,7 @@ impl VideoQoS {
             .min()
             .unwrap_or(FPS);
 
-        fps.clamp(MIN_FPS, mdm_max_fps())
+        fps.clamp(MIN_FPS, MAX_FPS)
     }
 
     // Get latest quality settings from all users
@@ -578,6 +614,7 @@ impl VideoQoS {
 
     // Adjust fps based on network delay and user response time
     fn adjust_fps(&mut self) {
+        let old_fps = self.fps;
         let highest_fps = if self.bus_mode {
             BUS_MAX_FPS
         } else {
@@ -591,15 +628,16 @@ impl VideoQoS {
             .min()
             .unwrap_or(INIT_FPS);
 
-        if self.users.iter().any(|u| u.1.delay.response_delayed) {
-            let min_allowed = if self.bus_mode { MIN_FPS } else { MIN_FPS + 1 };
-            if fps > min_allowed {
-                fps = min_allowed;
-            }
+        if !self.bus_mode {
+            fps = fps.max(highest_fps.min(INTERACTIVE_FPS_FLOOR));
         }
 
         // For new connections (within 1 second), cap fps to INIT_FPS to ensure stability
-        let init_limit = if self.bus_mode { BUS_INIT_FPS } else { INIT_FPS };
+        let init_limit = if self.bus_mode {
+            BUS_INIT_FPS
+        } else {
+            INIT_FPS
+        };
         if self.new_user_instant.elapsed().as_secs() < 1 {
             if fps > init_limit {
                 fps = init_limit;
@@ -607,18 +645,31 @@ impl VideoQoS {
         }
 
         // Ensure fps stays within valid range
-        self.fps = fps.clamp(MIN_FPS, highest_fps.min(mdm_max_fps()));
+        self.fps = fps.clamp(MIN_FPS, highest_fps);
+        if old_fps != self.fps {
+            let user_limits = self
+                .users
+                .iter()
+                .map(|(id, user)| {
+                    (
+                        *id,
+                        user.delay.fps,
+                        user.custom_fps,
+                        user.auto_adjust_fps,
+                        user.delay.response_delayed,
+                    )
+                })
+                .collect::<Vec<_>>();
+            log::warn!(
+                "MDM-QoS adjust_fps old={} new={} highest={} bus_mode={} users={:?}",
+                old_fps,
+                self.fps,
+                highest_fps,
+                self.bus_mode,
+                user_limits
+            );
+        }
     }
-}
-
-fn mdm_max_fps() -> u32 {
-    Config::get_option(MDM_MAX_FPS)
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|fps| *fps > 0)
-        .map(|fps| fps.clamp(MIN_FPS, MAX_FPS))
-        .unwrap_or(MAX_FPS)
 }
 
 #[derive(Default, Debug, Clone)]
@@ -676,5 +727,70 @@ impl RttCalculator {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moderate_delay_does_not_collapse_below_configured_fps() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.user_custom_fps(1, 12);
+
+        qos.user_network_delay(1, 225);
+
+        assert_eq!(qos.fps(), 12);
+    }
+
+    #[test]
+    fn high_delay_respects_quality_fps_floor() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.user_custom_fps(1, 12);
+
+        qos.user_network_delay(1, 900);
+
+        assert_eq!(qos.fps(), INTERACTIVE_FPS_FLOOR);
+    }
+
+    #[test]
+    fn delayed_subscriber_does_not_throttle_all_users_to_two_fps() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.user_custom_fps(1, 15);
+        qos.on_connection_open(2);
+        qos.user_custom_fps(2, 15);
+
+        qos.user_network_delay(1, 20);
+        qos.user_network_delay(2, 20);
+        qos.user_delay_response_elapsed(2, 2_500);
+
+        assert!(qos.fps() >= INTERACTIVE_FPS_FLOOR);
+    }
+
+    #[test]
+    fn client_auto_adjust_does_not_create_low_fps_feedback_loop() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.user_custom_fps(1, 15);
+        qos.user_auto_adjust_fps(1, 5);
+        qos.user_network_delay(1, 20);
+
+        assert_eq!(qos.fps(), INTERACTIVE_FPS_FLOOR);
+    }
+
+    #[test]
+    fn normal_network_feedback_cannot_drop_interactive_session_below_floor() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.user_custom_fps(1, 15);
+        qos.users.get_mut(&1).unwrap().delay.fps = Some(5);
+
+        qos.adjust_fps();
+
+        assert_eq!(qos.fps(), INTERACTIVE_FPS_FLOOR);
     }
 }

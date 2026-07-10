@@ -10,6 +10,7 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
+import android.os.Build
 import android.util.Log
 import ffi.FFI
 import java.io.File
@@ -82,6 +83,7 @@ class MdmControlProvider : ContentProvider() {
         // write RustDesk private files directly on non-root devices.
         val appDir = configDir()
         Log.i(TAG, "MDM-debug setServerConfig start: appDir=${appDir.absolutePath} hbbs=$hbbs hbbr=$hbbr audio=$audioEnabled keyLen=${key.length}")
+        context?.applicationContext?.let { MediaCodecInfoBridge.sync(it) }
         val options = linkedMapOf(
             "custom-rendezvous-server" to hbbs,
             "relay-server" to hbbr,
@@ -117,10 +119,19 @@ class MdmControlProvider : ContentProvider() {
     }
 
     private fun managedStreamOptions(extras: Bundle?): LinkedHashMap<String, String> {
-        val codec = extras.stringExtra(EXTRA_CODEC_PREFERENCE, "h264")
+        val requestedCodec = extras.stringExtra(EXTRA_CODEC_PREFERENCE, "h264")
             .lowercase()
             .takeIf { it in setOf("auto", "vp8", "vp9", "av1", "h264", "h265") }
             ?: "h264"
+        val codec = if (
+            Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q &&
+            requestedCodec in setOf("auto", "h264", "h265")
+        ) {
+            Log.w(TAG, "MDM managed codec fallback: requested=$requestedCodec effective=vp8 sdk=${Build.VERSION.SDK_INT}")
+            "vp8"
+        } else {
+            requestedCodec
+        }
         val audioEnabled = extras.booleanExtra(EXTRA_AUDIO_ENABLED, false)
         val fileTransferEnabled = extras.booleanExtra(EXTRA_FILE_TRANSFER_ENABLED, false)
         val tcpTunnelEnabled = extras.booleanExtra(EXTRA_TCP_TUNNEL_ENABLED, false)
@@ -380,6 +391,7 @@ class MdmControlProvider : ContentProvider() {
                 putBoolean(KEY_STATUS_AUDIO_ENABLED, isMdmAudioEnabled())
                 putBoolean(KEY_STATUS_AUDIO_RUNNING, MainService.isAudioStart)
                 putLong(KEY_STATUS_CAPTURE_FRAMES, MainService.captureFrames)
+                putLong(KEY_STATUS_CAPTURE_DUPLICATE_FRAMES, MainService.captureDuplicateFrames)
                 putLong(KEY_STATUS_CAPTURE_BYTES, MainService.captureBytes)
                 putLong(KEY_STATUS_CAPTURE_DROPPED_FRAMES, MainService.captureDroppedFrames)
                 putLong(KEY_STATUS_CAPTURE_ERRORS, MainService.captureErrors)
@@ -606,6 +618,7 @@ class MdmControlProvider : ContentProvider() {
         private const val KEY_STATUS_AUDIO_ENABLED = "audio_enabled"
         private const val KEY_STATUS_AUDIO_RUNNING = "audio_running"
         private const val KEY_STATUS_CAPTURE_FRAMES = "capture_frames"
+        private const val KEY_STATUS_CAPTURE_DUPLICATE_FRAMES = "capture_duplicate_frames"
         private const val KEY_STATUS_CAPTURE_BYTES = "capture_bytes"
         private const val KEY_STATUS_CAPTURE_DROPPED_FRAMES = "capture_dropped_frames"
         private const val KEY_STATUS_CAPTURE_ERRORS = "capture_errors"

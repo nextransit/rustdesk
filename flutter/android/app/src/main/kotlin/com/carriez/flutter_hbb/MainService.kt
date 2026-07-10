@@ -71,18 +71,22 @@ class MainService : Service() {
         if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
             ensureScreenInteractive("pointer_input")
         }
+        val mapped = mapRemoteInputToScreen(x, y)
+        val mappedX = mapped.first
+        val mappedY = mapped.second
         val inputService = InputService.ctx
         if (inputService != null) {
             Log.i(
                 logTag,
-                "MDM-InputDispatch pointer_route=accessibility kind=$kind mask=$mask x=$x y=$y"
+                "MDM-InputDispatch pointer_route=accessibility kind=$kind mask=$mask " +
+                    "raw_x=$x raw_y=$y x=$mappedX y=$mappedY"
             )
             when (kind) {
                 0 -> { // touch
-                    inputService.onTouchInput(mask, x, y)
+                    inputService.onTouchInput(mask, mappedX, mappedY)
                 }
                 1 -> { // mouse
-                    inputService.onMouseInput(mask, x, y)
+                    inputService.onMouseInput(mask, mappedX, mappedY)
                 }
                 else -> {
                     Log.w(logTag, "MDM-InputDispatch pointer_route=accessibility_ignored kind=$kind mask=$mask")
@@ -92,11 +96,21 @@ class MainService : Service() {
         }
         Log.w(
             logTag,
-            "MDM-InputDispatch pointer_route=provider_fallback reason=accessibility_unavailable kind=$kind mask=$mask x=$x y=$y"
+            "MDM-InputDispatch pointer_route=provider_fallback reason=accessibility_unavailable kind=$kind mask=$mask " +
+                "raw_x=$x raw_y=$y x=$mappedX y=$mappedY"
         )
-        if (!MdmInputFallback.pointer(applicationContext, kind, mask, x, y)) {
+        if (!MdmInputFallback.pointer(applicationContext, kind, mask, mappedX, mappedY)) {
             Log.w(logTag, "MDM-InputDispatch pointer_route=provider_fallback_failed kind=$kind mask=$mask")
         }
+    }
+
+    private fun mapRemoteInputToScreen(x: Int, y: Int): Pair<Int, Int> {
+        if (captureSourceValue != CAPTURE_SOURCE_MDM_SCREENRECORD || mdmCaptureWidth <= 0 || mdmCaptureHeight <= 0) {
+            return Pair(x, y)
+        }
+        val mappedX = (x.toDouble() * SCREEN_INFO.width.toDouble() / mdmCaptureWidth.toDouble()).toInt()
+        val mappedY = (y.toDouble() * SCREEN_INFO.height.toDouble() / mdmCaptureHeight.toDouble()).toInt()
+        return Pair(mappedX, mappedY)
     }
 
     @Keep
@@ -161,7 +175,11 @@ class MainService : Service() {
                                 logTag,
                                 "add_connection: authorized=$authorized isStart=$isStart mediaProjection=${mediaProjection != null}"
                             )
-                            if (mediaProjection == null) {
+                            if (requiresMdmSystemScreenrecord()) {
+                                if (!switchToMdmSystemScreenrecordCapture("add_connection", false)) {
+                                    Log.w(logTag, "add_connection: managed screenrecord source is not ready")
+                                }
+                            } else if (mediaProjection == null) {
                                 Log.d(logTag, "add_connection: mediaProjection null, requesting")
                                 requestMediaProjection()
                             } else if (!isStart) {
@@ -270,17 +288,23 @@ class MainService : Service() {
 
     companion object {
         private const val CAPTURE_STATS_LOG_INTERVAL_MS = 5_000L
+        private const val MDM_MAX_PUBLISH_FPS = 15
+        private const val MDM_MIN_PUBLISH_INTERVAL_MS = 1000L / MDM_MAX_PUBLISH_FPS
+        private const val MDM_KEEPALIVE_FRAME_INTERVAL_MS = 250L
+        private const val MDM_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024
         private const val CAPTURE_LOG_TAG = "LOG_SERVICE"
         private const val MEDIA_PROJECTION_REQUEST_TTL_MS = 12_000L
         private const val CAPTURE_SOURCE_NONE = "none"
         private const val CAPTURE_SOURCE_MEDIA_PROJECTION = "media_projection"
         private const val CAPTURE_SOURCE_MDM_SCREENRECORD = "mdm_screenrecord"
+        private const val MDM_SOFTWARE_AVC_DECODER = "OMX.google.h264.decoder"
         private var _isReady = false // media permission ready status
         private var _isStart = false // screen capture start status
         private var _isAudioStart = false // audio capture start status
         private val captureFrameCount = AtomicLong(0)
         private val captureByteCount = AtomicLong(0)
         private val captureDroppedFrameCount = AtomicLong(0)
+        private val captureDuplicateFrameCount = AtomicLong(0)
         private val captureErrorCount = AtomicLong(0)
         @Volatile private var captureStartedAtMs = 0L
         @Volatile private var captureLastFrameAtMs = 0L
@@ -308,6 +332,8 @@ class MainService : Service() {
             get() = captureByteCount.get()
         val captureDroppedFrames: Long
             get() = captureDroppedFrameCount.get()
+        val captureDuplicateFrames: Long
+            get() = captureDuplicateFrameCount.get()
         val captureErrors: Long
             get() = captureErrorCount.get()
         val captureStartedAt: Long
@@ -500,8 +526,23 @@ class MainService : Service() {
 
     // P0-fix(mdm-companion-android-9): mdm screenrecord 路径用 Annex-B H264 增量解码
     @Volatile private var mdmScreenrecordThread: Thread? = null
+    @Volatile private var mdmKeepaliveThread: Thread? = null
     private var mdmDecoder: MediaCodec? = null
+    private var mdmDecoderStarted = false
     @Volatile private var mdmDecoderOutputImageUnavailableLogged = false
+    @Volatile private var mdmLastRgbaFrame: ByteBuffer? = null
+    @Volatile private var mdmLastFrameOutputAtMs = 0L
+    @Volatile private var mdmLastDecodedFramePublishedAtMs = 0L
+    @Volatile private var mdmBootstrapInProgress = false
+    private var mdmPendingBootstrapFrame: ByteBuffer? = null
+    private var mdmKeepaliveFrameCount = 0L
+    private var mdmRgbaScratch: ByteBuffer? = null
+
+    private data class MdmFeedBootstrap(
+        val nalUnits: List<ByteArray>,
+        val pendingBytes: ByteArray,
+        val streamOffset: Long
+    )
 
     // audio
     private val audioRecordHandle = AudioRecordHandle(this, { isStart }, { isAudioStart })
@@ -605,7 +646,13 @@ class MainService : Service() {
                         "old=${oldWidth}x${oldHeight}@${oldDpi}/$oldScale " +
                         "new=${w}x${h}@${dpi}/$scale was_capturing=$isStart"
                 )
-                if (isStart) {
+                if (isStart && captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD) {
+                    Log.i(
+                        logTag,
+                        "MDM-OrientationChange waiting_for_agent_screenrecord_restart " +
+                            "capture=${mdmCaptureWidth}x${mdmCaptureHeight} target=${w}x${h}"
+                    )
+                } else if (isStart) {
                     markCaptureInactive(
                         reason = "orientation_changed",
                         clearMediaProjection = false,
@@ -716,7 +763,11 @@ class MainService : Service() {
                 Log.d(logTag, "mdm start: ACT_START_NO_PROJECTION")
                 createForegroundNotification()
                 FFI.startService(appFlutterDir())
-                if (!isStart) {
+                if (!isStart && requiresMdmSystemScreenrecord() && useMdmSystemScreenrecord()) {
+                    if (!startMdmScreenrecordCapture()) {
+                        Log.w(logTag, "mdm start: managed screenrecord capture failed")
+                    }
+                } else if (!isStart) {
                     _isReady = false
                 }
             }
@@ -767,6 +818,13 @@ class MainService : Service() {
     }
 
     private fun requestMediaProjection() {
+        if (requiresMdmSystemScreenrecord()) {
+            Log.w(logTag, "MediaProjection request blocked: managed screenrecord is mandatory on sdk=${Build.VERSION.SDK_INT}")
+            if (!switchToMdmSystemScreenrecordCapture("projection_request_blocked", false)) {
+                Log.w(logTag, "managed screenrecord source is not ready while blocking MediaProjection")
+            }
+            return
+        }
         if (mediaProjectionRequestInFlight) {
             Log.d(logTag, "MediaProjection request already in flight")
             return
@@ -840,11 +898,6 @@ class MainService : Service() {
         if (isStart) {
             return isReady
         }
-        val activeProjection = projection
-        if (activeProjection == null) {
-            Log.w(logTag, "startCapture fail,mediaProjection is null")
-            return false
-        }
         keepScreenInteractive("start_capture")
 
         updateScreenInfo(resources.configuration.orientation)
@@ -855,10 +908,20 @@ class MainService : Service() {
         // Annex-B H264 增量解码避开 MediaProjection + VirtualDisplaySurface bug.
         if (useMdmSystemScreenrecord()) {
             Log.i(logTag, "startCapture: routing to mdm screenrecord path (Android 9 bypass)")
-            if (startMdmScreenrecordCapture(activeProjection)) {
+            if (startMdmScreenrecordCapture(projection)) {
                 return true
             }
-            Log.w(logTag, "mdm screenrecord path failed, falling back to MediaProjection")
+            Log.w(logTag, "mdm screenrecord path failed")
+        }
+        if (requiresMdmSystemScreenrecord()) {
+            Log.e(logTag, "MediaProjection fallback blocked on managed sdk=${Build.VERSION.SDK_INT}")
+            return false
+        }
+
+        val activeProjection = projection
+        if (activeProjection == null) {
+            Log.w(logTag, "startCapture fail,mediaProjection is null")
+            return false
         }
 
         surface = createSurface()
@@ -1288,6 +1351,10 @@ class MainService : Service() {
         }
     }
 
+    private fun requiresMdmSystemScreenrecord(): Boolean {
+        return Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q
+    }
+
     /**
      * P0-fix: 启动 MediaCodec 解码器增量读取 mdm screenrecord Annex-B h264 文件,
      * 把解码出的 RGBA frame 通过现有 FFI.onVideoFrameUpdate 推给 rust 端.
@@ -1330,13 +1397,13 @@ class MainService : Service() {
             )
         }
         val switched = startMdmScreenrecordCapture(projection)
-        if (!switched && projection != null) {
-            Log.w(logTag, "switch to mdm screenrecord failed; falling back to MediaProjection")
-            startCapture(projection)
+        if (!switched) {
+            Log.w(logTag, "switch to mdm screenrecord failed; MediaProjection fallback is disabled")
         }
         return switched
     }
 
+    @Synchronized
     private fun startMdmScreenrecordCapture(activeProjection: MediaProjection? = mediaProjection): Boolean {
         try {
             val screenFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen.h264")
@@ -1352,18 +1419,44 @@ class MainService : Service() {
             val screenMeta = readMdmScreenrecordMeta()
             val frameWidth = screenMeta.first
             val frameHeight = screenMeta.second
+            val activeFeed = mdmScreenrecordThread
+            if (
+                _isStart &&
+                captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD &&
+                mdmDecoder != null &&
+                activeFeed?.isAlive == true &&
+                mdmCaptureWidth == frameWidth &&
+                mdmCaptureHeight == frameHeight
+            ) {
+                Log.i(logTag, "mdm screenrecord capture already active: ${frameWidth}x${frameHeight}")
+                return true
+            }
+            if (mdmDecoder != null || activeFeed != null || mdmKeepaliveThread != null) {
+                Log.w(logTag, "mdm screenrecord stale capture resources detected; releasing before restart")
+                stopMdmScreenrecordCapture()
+            }
             val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, frameWidth, frameHeight)
             videoFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024)
             videoFormat.setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
             )
-            mdmDecoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            mdmDecoder = createMdmScreenrecordDecoder()
+            mdmDecoderStarted = false
             mdmDecoder!!.configure(videoFormat, null, null, 0)
             mdmDecoder!!.start()
+            mdmDecoderStarted = true
             mdmDecoderOutputImageUnavailableLogged = false
+            mdmLastRgbaFrame = null
+            mdmLastFrameOutputAtMs = 0L
+            mdmLastDecodedFramePublishedAtMs = 0L
+            mdmBootstrapInProgress = false
+            mdmPendingBootstrapFrame = null
+            mdmKeepaliveFrameCount = 0L
+            mdmRgbaScratch = null
 
             _isStart = true
+            _isReady = true
             captureSourceValue = CAPTURE_SOURCE_MDM_SCREENRECORD
             mdmCaptureWidth = frameWidth
             mdmCaptureHeight = frameHeight
@@ -1372,6 +1465,7 @@ class MainService : Service() {
             MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
             FFI.setFrameRawEnable("video", true)
             startMdmScreenrecordFeedThread(screenFile, mdmDecoder!!)
+            startMdmKeepaliveThread(mdmDecoder!!)
             startAudioForCapture(activeProjection, CAPTURE_SOURCE_MDM_SCREENRECORD)
             checkMediaPermission()
             Log.i(logTag, "mdm screenrecord capture started: ${screenFile.absolutePath}")
@@ -1381,6 +1475,7 @@ class MainService : Service() {
             stopMdmScreenrecordCapture()
             FFI.setFrameRawEnable("video", false)
             _isStart = false
+            _isReady = false
             captureSourceValue = CAPTURE_SOURCE_NONE
             mdmCaptureWidth = 0
             mdmCaptureHeight = 0
@@ -1391,6 +1486,19 @@ class MainService : Service() {
     private fun readMdmScreenrecordMeta(): Pair<Int, Int> {
         return readMdmScreenrecordMetaFromFile(logFailure = true)
             ?: Pair(SCREEN_INFO.width, SCREEN_INFO.height)
+    }
+
+    private fun createMdmScreenrecordDecoder(): MediaCodec {
+        return try {
+            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also {
+                Log.i(logTag, "mdm screenrecord decoder selected: ${it.name}")
+            }
+        } catch (e: Throwable) {
+            Log.w(logTag, "default AVC decoder unavailable; falling back to software: ${e.message}")
+            MediaCodec.createByCodecName(MDM_SOFTWARE_AVC_DECODER).also {
+                Log.i(logTag, "mdm screenrecord decoder selected: $MDM_SOFTWARE_AVC_DECODER")
+            }
+        }
     }
 
     private fun readMdmScreenrecordMetaIfRunning(): Pair<Int, Int>? {
@@ -1435,7 +1543,33 @@ class MainService : Service() {
         val yBuffer = yPlane.buffer
         val uBuffer = uPlane.buffer
         val vBuffer = vPlane.buffer
-        val rgbaBuffer = ByteBuffer.allocateDirect(imageWidth * imageHeight * 4)
+        val requiredBytes = imageWidth * imageHeight * 4
+        val rgbaBuffer = mdmRgbaScratch
+            ?.takeIf { it.capacity() == requiredBytes }
+            ?: ByteBuffer.allocateDirect(requiredBytes).also { mdmRgbaScratch = it }
+        rgbaBuffer.clear()
+
+        if (FFI.convertYuv420ToRgba(
+                yBuffer,
+                uBuffer,
+                vBuffer,
+                rgbaBuffer,
+                imageWidth,
+                imageHeight,
+                yBuffer.position(),
+                uBuffer.position(),
+                vBuffer.position(),
+                yPlane.rowStride,
+                uPlane.rowStride,
+                vPlane.rowStride,
+                uPlane.pixelStride,
+                vPlane.pixelStride
+            )
+        ) {
+            rgbaBuffer.position(0)
+            rgbaBuffer.limit(requiredBytes)
+            return rgbaBuffer
+        }
 
         for (rowIndex in 0 until imageHeight) {
             val uvRowIndex = rowIndex / 2
@@ -1475,27 +1609,50 @@ class MainService : Service() {
             var pendingBytes = ByteArray(0)
             var streamOffset = 0L
             var presentationTimeUs = 0L
+            var suppressOutputThroughUs: Long? = null
             var stream: java.io.RandomAccessFile? = null
-            var openedLastModified = 0L
             try {
                 while (isStart && mdmDecoder === decoder) {
-                    drainMdmDecoderOutput(decoder)
+                    drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
                     if (!screenFile.exists()) {
                         Thread.sleep(20)
                         continue
                     }
                     val currentLength = screenFile.length()
-                    val currentLastModified = screenFile.lastModified()
                     if (stream == null ||
-                        currentLength < streamOffset ||
-                        (currentLastModified != openedLastModified && streamOffset >= currentLength)
+                        currentLength < streamOffset
                     ) {
+                        val openReason = if (stream == null) "initial" else "truncated"
                         runCatching { stream?.close() }
                         stream = java.io.RandomAccessFile(screenFile, "r")
-                        streamOffset = 0L
-                        pendingBytes = ByteArray(0)
-                        openedLastModified = currentLastModified
-                        Log.i(logTag, "mdm h264 feed opened: size=$currentLength modified=$currentLastModified")
+                        val bootstrap = readMdmFeedBootstrap(stream, currentLength)
+                        streamOffset = bootstrap.streamOffset
+                        pendingBytes = bootstrap.pendingBytes
+                        Log.i(
+                            logTag,
+                            "mdm h264 feed opened: size=$currentLength modified=${screenFile.lastModified()} " +
+                                "reason=$openReason bootstrap_nals=${bootstrap.nalUnits.size} " +
+                                "tail_bytes=${bootstrap.pendingBytes.size}"
+                        )
+                        mdmBootstrapInProgress = true
+                        mdmPendingBootstrapFrame = null
+                        for (nalUnit in bootstrap.nalUnits) {
+                            while (isStart && mdmDecoder === decoder) {
+                                drainMdmDecoderOutput(decoder, Long.MAX_VALUE)
+                                if (queueMdmDecoderInput(decoder, nalUnit, presentationTimeUs)) {
+                                    presentationTimeUs += 33_333L
+                                    break
+                                }
+                                Thread.sleep(5)
+                            }
+                        }
+                        suppressOutputThroughUs = (presentationTimeUs - 33_333L).coerceAtLeast(0L)
+                        repeat(10) {
+                            drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
+                            Thread.sleep(5L)
+                        }
+                        publishMdmBootstrapFrame(openReason, bootstrap.nalUnits.size)
+                        mdmBootstrapInProgress = false
                     }
                     val activeStream = stream ?: continue
                     val availableBytes = currentLength - streamOffset
@@ -1519,7 +1676,7 @@ class MainService : Service() {
                     pendingBytes = parsedNalUnits.second
                     for (nalUnit in parsedNalUnits.first) {
                         while (isStart && mdmDecoder === decoder) {
-                            drainMdmDecoderOutput(decoder)
+                            drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
                             if (queueMdmDecoderInput(decoder, nalUnit, presentationTimeUs)) {
                                 presentationTimeUs += 33_333L
                                 break
@@ -1528,7 +1685,7 @@ class MainService : Service() {
                         }
                     }
                 }
-                drainMdmDecoderOutput(decoder)
+                drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
             } catch (e: Throwable) {
                 if (isStart) {
                     Log.w(logTag, "mdm h264 feed error: ${e.message}", e)
@@ -1540,6 +1697,52 @@ class MainService : Service() {
         }, "mdm-screenrecord-feed")
         mdmScreenrecordThread = feedThread
         feedThread.start()
+    }
+
+    private fun startMdmKeepaliveThread(decoder: MediaCodec) {
+        val keepaliveThread = Thread({
+            while (isStart && mdmDecoder === decoder) {
+                emitMdmKeepaliveFrameIfNeeded()
+                Thread.sleep(20L)
+            }
+        }, "mdm-screenrecord-keepalive")
+        mdmKeepaliveThread = keepaliveThread
+        keepaliveThread.start()
+    }
+
+    private fun readMdmFeedBootstrap(
+        stream: java.io.RandomAccessFile,
+        currentLength: Long
+    ): MdmFeedBootstrap {
+        if (currentLength <= 0L) {
+            return MdmFeedBootstrap(emptyList(), ByteArray(0), 0L)
+        }
+        val readLength = min(currentLength, MDM_BOOTSTRAP_MAX_BYTES.toLong()).toInt()
+        val startOffset = currentLength - readLength
+        val bytes = ByteArray(readLength)
+        stream.seek(startOffset)
+        stream.readFully(bytes)
+        val parsed = extractCompleteAnnexBNalUnits(bytes)
+        val nalUnits = parsed.first
+        val idrIndex = nalUnits.indexOfLast { mdmH264NalType(it) == 5 }
+        if (idrIndex < 0) {
+            return MdmFeedBootstrap(emptyList(), parsed.second, currentLength)
+        }
+        val spsIndex = (idrIndex downTo 0).firstOrNull { mdmH264NalType(nalUnits[it]) == 7 }
+        val ppsIndex = (idrIndex downTo 0).firstOrNull { mdmH264NalType(nalUnits[it]) == 8 }
+        val selected = ArrayList<ByteArray>()
+        spsIndex?.let { selected.add(nalUnits[it]) }
+        ppsIndex?.let { selected.add(nalUnits[it]) }
+        selected.addAll(nalUnits.subList(idrIndex, nalUnits.size))
+        return MdmFeedBootstrap(selected, parsed.second, currentLength)
+    }
+
+    private fun mdmH264NalType(nalUnit: ByteArray): Int {
+        val startOffset = findAnnexBStartCode(nalUnit, 0)
+        if (startOffset < 0) return -1
+        val headerOffset = startOffset + annexBStartCodeLength(nalUnit, startOffset)
+        if (headerOffset >= nalUnit.size) return -1
+        return nalUnit[headerOffset].toInt() and 0x1f
     }
 
     private fun queueMdmDecoderInput(decoder: MediaCodec, nalUnit: ByteArray, presentationTimeUs: Long): Boolean {
@@ -1562,7 +1765,7 @@ class MainService : Service() {
         return true
     }
 
-    private fun drainMdmDecoderOutput(decoder: MediaCodec) {
+    private fun drainMdmDecoderOutput(decoder: MediaCodec, suppressOutputThroughUs: Long? = null) {
         val bufferInfo = MediaCodec.BufferInfo()
         while (true) {
             val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
@@ -1570,12 +1773,30 @@ class MainService : Service() {
                 outputIndex >= 0 -> {
                     try {
                         if (bufferInfo.size > 0 && isStart) {
+                            val now = System.currentTimeMillis()
+                            val suppressCurrentOutput = suppressOutputThroughUs != null &&
+                                bufferInfo.presentationTimeUs <= suppressOutputThroughUs
+                            if (
+                                !suppressCurrentOutput &&
+                                mdmLastDecodedFramePublishedAtMs > 0L &&
+                                now - mdmLastDecodedFramePublishedAtMs < MDM_MIN_PUBLISH_INTERVAL_MS
+                            ) {
+                                continue
+                            }
                             val rgbaBuffer = mdmDecoderOutputToRgba(decoder, outputIndex, bufferInfo)
                             if (rgbaBuffer != null) {
                                 rgbaBuffer.rewind()
                                 val byteCount = rgbaBuffer.remaining()
-                                FFI.onVideoFrameUpdate(rgbaBuffer)
-                                recordCaptureFrame(byteCount)
+                                val frame = copyMdmRgbaFrame(rgbaBuffer)
+                                if (suppressCurrentOutput) {
+                                    mdmPendingBootstrapFrame = frame
+                                } else {
+                                    FFI.onVideoFrameUpdate(rgbaBuffer)
+                                    mdmLastRgbaFrame = frame
+                                    mdmLastFrameOutputAtMs = now
+                                    mdmLastDecodedFramePublishedAtMs = now
+                                    recordCaptureFrame(byteCount)
+                                }
                             } else {
                                 recordCaptureDroppedFrame("mdm_decoder_empty_output")
                             }
@@ -1592,6 +1813,54 @@ class MainService : Service() {
                 outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> return
                 else -> return
             }
+        }
+    }
+
+    private fun publishMdmBootstrapFrame(reason: String, bootstrapNalCount: Int) {
+        val frame = mdmPendingBootstrapFrame?.duplicate()?.apply { rewind() }
+        mdmPendingBootstrapFrame = null
+        if (frame == null) {
+            Log.w(logTag, "mdm bootstrap produced no frame reason=$reason nals=$bootstrapNalCount")
+            return
+        }
+        val byteCount = frame.remaining()
+        FFI.onVideoFrameUpdate(frame)
+        mdmLastRgbaFrame = frame.asReadOnlyBuffer().apply { rewind() }
+        val now = System.currentTimeMillis()
+        mdmLastFrameOutputAtMs = now
+        mdmLastDecodedFramePublishedAtMs = now
+        recordCaptureFrame(byteCount)
+        Log.i(logTag, "mdm bootstrap published latest frame only reason=$reason nals=$bootstrapNalCount")
+    }
+
+    private fun copyMdmRgbaFrame(source: ByteBuffer): ByteBuffer {
+        val input = source.duplicate().apply { rewind() }
+        return ByteBuffer.allocateDirect(input.remaining()).apply {
+            put(input)
+            flip()
+        }.asReadOnlyBuffer()
+    }
+
+    private fun emitMdmKeepaliveFrameIfNeeded() {
+        if (mdmBootstrapInProgress) {
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (now - mdmLastFrameOutputAtMs < MDM_KEEPALIVE_FRAME_INTERVAL_MS) {
+            return
+        }
+        val frame = mdmLastRgbaFrame?.duplicate()?.apply { rewind() } ?: return
+        val byteCount = frame.remaining()
+        FFI.onVideoFrameUpdate(frame)
+        mdmLastFrameOutputAtMs = now
+        mdmKeepaliveFrameCount += 1
+        captureDuplicateFrameCount.incrementAndGet()
+        if (mdmKeepaliveFrameCount <= 3L || mdmKeepaliveFrameCount % 100L == 0L) {
+            Log.i(
+                logTag,
+                "MDM-CaptureKeepalive duplicate_frames=$mdmKeepaliveFrameCount " +
+                    "interval_ms=$MDM_KEEPALIVE_FRAME_INTERVAL_MS bytes=$byteCount"
+            )
         }
     }
 
@@ -1755,9 +2024,13 @@ class MainService : Service() {
      */
     private fun stopMdmScreenrecordCapture() {
         val feedThread = mdmScreenrecordThread
+        val keepaliveThread = mdmKeepaliveThread
         val decoder = mdmDecoder
+        val decoderStarted = mdmDecoderStarted
         mdmScreenrecordThread = null
+        mdmKeepaliveThread = null
         mdmDecoder = null
+        mdmDecoderStarted = false
         if (feedThread != null && feedThread !== Thread.currentThread()) {
             try {
                 feedThread.join(2000L)
@@ -1766,10 +2039,26 @@ class MainService : Service() {
                 }
             } catch (_: Throwable) {}
         }
+        if (keepaliveThread != null && keepaliveThread !== Thread.currentThread()) {
+            try {
+                keepaliveThread.join(1000L)
+            } catch (_: Throwable) {}
+        }
+        mdmLastRgbaFrame = null
+        mdmLastFrameOutputAtMs = 0L
+        mdmLastDecodedFramePublishedAtMs = 0L
+        mdmBootstrapInProgress = false
+        mdmPendingBootstrapFrame = null
+        mdmKeepaliveFrameCount = 0L
+        mdmRgbaScratch = null
+        if (decoderStarted) {
+            try {
+                decoder?.stop()
+            } catch (e: Throwable) { Log.w(logTag, "mdm decoder stop: ${e.message}") }
+        }
         try {
-            decoder?.stop()
-        } catch (e: Throwable) { Log.w(logTag, "mdm decoder stop: ${e.message}") }
-        decoder?.release()
+            decoder?.release()
+        } catch (e: Throwable) { Log.w(logTag, "mdm decoder release: ${e.message}") }
         mdmDecoderOutputImageUnavailableLogged = false
         Log.i(logTag, "mdm screenrecord capture released")
     }

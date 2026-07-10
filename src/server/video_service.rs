@@ -51,6 +51,8 @@ use scrap::{
     vpxcodec::{VpxEncoderConfig, VpxVideoCodecId},
     CodecFormat, Display, EncodeInput, TraitCapturer, TraitPixelBuffer,
 };
+#[cfg(target_os = "android")]
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 use std::sync::Once;
 use std::{
@@ -61,6 +63,9 @@ use std::{
 };
 
 pub const OPTION_REFRESH: &'static str = "refresh";
+
+#[cfg(target_os = "android")]
+static ANDROID_REFRESH_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
@@ -652,18 +657,26 @@ fn run(vs: VideoService) -> ResultType<()> {
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
-	let capture_width = c.width;
-	let capture_height = c.height;
-	let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+    let capture_width = c.width;
+    let capture_height = c.height;
+    let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+    #[cfg(target_os = "android")]
+    let android_refresh_epoch = ANDROID_REFRESH_EPOCH.load(Ordering::Acquire);
 
-	// — 公交车载: 静态画面帧跳过 —
-	// 车辆静止时画面几乎不变, 跳过编码可节省 80-90% 流量.
-	// last_yuv_hash: 前帧 YUV 数据的采样哈希, 用于判断画面是否变化.
-	let mut last_yuv_hash: u64 = 0;
-	let mut static_frame_count: u32 = 0;
-	let mut last_keyframe_instant: Instant = Instant::now();
+    // — 公交车载: 静态画面帧跳过 —
+    // 车辆静止时画面几乎不变, 跳过编码可节省 80-90% 流量.
+    // last_yuv_hash: 前帧 YUV 数据的采样哈希, 用于判断画面是否变化.
+    let mut last_yuv_hash: u64 = 0;
+    let mut static_frame_count: u32 = 0;
+    let mut last_keyframe_instant: Instant = Instant::now();
 
     while sp.ok() {
+        #[cfg(target_os = "android")]
+        if ANDROID_REFRESH_EPOCH.load(Ordering::Acquire) != android_refresh_epoch {
+            let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
+            log::info!("switch due to Android screen size refresh");
+            bail!("SWITCH");
+        }
         #[cfg(windows)]
         check_uac_switch(c.privacy_mode_id, c._capturer_privacy_mode_id)?;
         check_qos(
@@ -796,7 +809,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                         drop(video_qos);
                         if skip {
                             // 采样 hash: 均匀取 Y 平面 64 个位置 (用 snapshot 避免与 frame 借用冲突)
-                            let y_len = yuv_snapshot.len().min(capture_width as usize * capture_height as usize);
+                            let y_len = yuv_snapshot
+                                .len()
+                                .min(capture_width as usize * capture_height as usize);
                             let step = (y_len / 64).max(4) as usize;
                             let mut hash: u64 = 5381;
                             let mut i = 0;
@@ -811,10 +826,10 @@ fn run(vs: VideoService) -> ResultType<()> {
                                 last_yuv_hash = hash;
                                 static_frame_count = 0;
                             }
-                            // 静态画面: 每 60 帧强制发送一次 (保证连接不断)
-                            // 或者最近一次发帧已过 2 秒
+                            // 静态画面也维持约 2.5 FPS，避免 Dashboard 被旧帧/低帧率
+                            // 判定为停滞，同时保持远程点击后的视觉反馈连续。
                             let force_send = static_frame_count >= 60
-                                || last_keyframe_instant.elapsed().as_secs() >= 2;
+                                || last_keyframe_instant.elapsed() >= Duration::from_millis(400);
                             if static_frame_count > 0 && !force_send {
                                 // 跳过编码, 不发送
                                 frame_controller.set_send(now, HashSet::new());
@@ -924,13 +939,17 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
 
         let mut fetched_conn_ids = HashSet::new();
-        let timeout_millis = 3_000u64;
+        let timeout_millis = if cfg!(target_os = "android") {
+            spf.as_millis().clamp(10, 100) as u64
+        } else {
+            3_000u64
+        };
         let wait_begin = Instant::now();
         while wait_begin.elapsed().as_millis() < timeout_millis as _ {
             if vs.source.is_monitor() {
                 check_privacy_mode_changed(&sp, display_idx, &c)?;
             }
-            frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
+            frame_controller.try_wait_next(&mut fetched_conn_ids, timeout_millis.min(300));
             // break if all connections have received current frame
             if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
                 break;
@@ -1259,7 +1278,10 @@ fn handle_one_frame(
 #[inline]
 pub fn refresh() {
     #[cfg(target_os = "android")]
-    Display::refresh_size();
+    {
+        Display::refresh_size();
+        ANDROID_REFRESH_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(windows)]
@@ -1395,6 +1417,15 @@ fn check_qos(
         bail!("SWITCH");
     }
     if second_instant.elapsed() > Duration::from_secs(1) {
+        log::warn!(
+            "MDM-VideoPipeline service={} target_fps={} encoded_frames={} frame_interval_ms={} ratio={:.3} bitrate_kbps={}",
+            name,
+            video_qos.fps(),
+            *send_counter,
+            spf.as_millis(),
+            *ratio,
+            video_qos.bitrate()
+        );
         *second_instant = Instant::now();
         video_qos.update_display_data(&name, *send_counter);
         *send_counter = 0;
