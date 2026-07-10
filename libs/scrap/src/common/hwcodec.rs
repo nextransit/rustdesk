@@ -1,5 +1,8 @@
 use crate::{
-    codec::{base_bitrate, codec_thread_num, enable_hwcodec_option, EncoderApi, EncoderCfg},
+    codec::{
+        base_bitrate, clamp_mdm_bitrate_kbps, codec_thread_num, enable_hwcodec_option, EncoderApi,
+        EncoderCfg,
+    },
     convert::*,
     CodecFormat, EncodeInput, ImageFormat, ImageRgb, Pixfmt, HW_STRIDE_ALIGN,
 };
@@ -249,7 +252,10 @@ impl HwRamEncoder {
     }
 
     pub fn bitrate(name: &str, width: usize, height: usize, ratio: f32) -> u32 {
-        Self::calc_bitrate(width, height, ratio, name.contains("h264"))
+        clamp_mdm_bitrate_kbps(
+            name,
+            Self::calc_bitrate(width, height, ratio, name.contains("h264")),
+        )
     }
 
     pub fn calc_bitrate(width: usize, height: usize, ratio: f32, h264: bool) -> u32 {
