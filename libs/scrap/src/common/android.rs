@@ -14,6 +14,31 @@ pub struct Capturer {
     display: Display,
     rgba: Vec<u8>,
     saved_raw_data: Vec<u8>, // for faster compare and copy
+    rgba_scaled: Vec<u8>, // downscaled buffer
+}
+
+fn get_scale() -> f64 {
+    hbb_common::config::Config::get_option("mdm-scale-resolution-down-by")
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(1.0)
+        .max(1.0)
+}
+
+fn downscale_rgba(src: &[u8], src_w: usize, src_h: usize, dst: &mut Vec<u8>, dst_w: usize, dst_h: usize) {
+    dst.resize(dst_w * dst_h * 4, 0);
+    for dy in 0..dst_h {
+        let sy = (dy * src_h) / dst_h;
+        let src_row_offset = sy * src_w * 4;
+        let dst_row_offset = dy * dst_w * 4;
+        for dx in 0..dst_w {
+            let sx = (dx * src_w) / dst_w;
+            let src_pixel_offset = src_row_offset + sx * 4;
+            let dst_pixel_offset = dst_row_offset + dx * 4;
+            dst[dst_pixel_offset..dst_pixel_offset + 4]
+                .copy_from_slice(&src[src_pixel_offset..src_pixel_offset + 4]);
+        }
+    }
 }
 
 impl Capturer {
@@ -22,26 +47,63 @@ impl Capturer {
             display,
             rgba: Vec::new(),
             saved_raw_data: Vec::new(),
+            rgba_scaled: Vec::new(),
         })
     }
 
     pub fn width(&self) -> usize {
-        self.display.width() as usize
+        let scale = get_scale();
+        if scale > 1.001 {
+            let mut w = (self.display.width() as f64 / scale) as usize;
+            w = (w / 2) * 2;
+            w.max(16)
+        } else {
+            self.display.width() as usize
+        }
     }
 
     pub fn height(&self) -> usize {
-        self.display.height() as usize
+        let scale = get_scale();
+        if scale > 1.001 {
+            let mut h = (self.display.height() as f64 / scale) as usize;
+            h = (h / 2) * 2;
+            h.max(16)
+        } else {
+            self.display.height() as usize
+        }
     }
 }
 
 impl crate::TraitCapturer for Capturer {
     fn frame<'a>(&'a mut self, _timeout: Duration) -> io::Result<Frame<'a>> {
         if get_video_raw(&mut self.rgba, &mut self.saved_raw_data).is_some() {
-            Ok(Frame::PixelBuffer(PixelBuffer::new(
-                &self.rgba,
-                self.width(),
-                self.height(),
-            )))
+            let scale = get_scale();
+            if scale > 1.001 {
+                let orig_w = self.display.width() as usize;
+                let orig_h = self.display.height() as usize;
+                let dst_w = self.width();
+                let dst_h = self.height();
+                if self.rgba.len() >= orig_w * orig_h * 4 {
+                    downscale_rgba(&self.rgba, orig_w, orig_h, &mut self.rgba_scaled, dst_w, dst_h);
+                    Ok(Frame::PixelBuffer(PixelBuffer::new(
+                        &self.rgba_scaled,
+                        dst_w,
+                        dst_h,
+                    )))
+                } else {
+                    Ok(Frame::PixelBuffer(PixelBuffer::new(
+                        &self.rgba,
+                        orig_w,
+                        orig_h,
+                    )))
+                }
+            } else {
+                Ok(Frame::PixelBuffer(PixelBuffer::new(
+                    &self.rgba,
+                    self.width(),
+                    self.height(),
+                )))
+            }
         } else {
             return Err(io::ErrorKind::WouldBlock.into());
         }

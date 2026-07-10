@@ -1,7 +1,7 @@
 use jni::objects::JByteBuffer;
 use jni::objects::JString;
 use jni::objects::JValue;
-use jni::sys::jboolean;
+use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use jni::{
     objects::{GlobalRef, JClass, JObject},
@@ -58,7 +58,7 @@ lazy_static! {
 const MAX_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_AUDIO_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
 const RAW_FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(750);
+const FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 
 struct FrameRaw {
     name: &'static str,
@@ -240,6 +240,147 @@ pub extern "system" fn Java_ffi_FFI_onVideoFrameUpdate(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_ffi_FFI_convertYuv420ToRgba(
+    env: JNIEnv,
+    _class: JClass,
+    y_buffer: JObject,
+    u_buffer: JObject,
+    v_buffer: JObject,
+    output_buffer: JObject,
+    width: jint,
+    height: jint,
+    y_position: jint,
+    u_position: jint,
+    v_position: jint,
+    y_row_stride: jint,
+    u_row_stride: jint,
+    v_row_stride: jint,
+    u_pixel_stride: jint,
+    v_pixel_stride: jint,
+) -> jboolean {
+    if width <= 0
+        || height <= 0
+        || y_position < 0
+        || u_position < 0
+        || v_position < 0
+        || y_row_stride <= 0
+        || u_row_stride <= 0
+        || v_row_stride <= 0
+        || u_pixel_stride <= 0
+        || v_pixel_stride <= 0
+    {
+        return JNI_FALSE;
+    }
+
+    let y_byte_buffer = JByteBuffer::from(y_buffer);
+    let u_byte_buffer = JByteBuffer::from(u_buffer);
+    let v_byte_buffer = JByteBuffer::from(v_buffer);
+    let output_byte_buffer = JByteBuffer::from(output_buffer);
+    let Ok(y_data) = env.get_direct_buffer_address(&y_byte_buffer) else {
+        return JNI_FALSE;
+    };
+    let Ok(u_data) = env.get_direct_buffer_address(&u_byte_buffer) else {
+        return JNI_FALSE;
+    };
+    let Ok(v_data) = env.get_direct_buffer_address(&v_byte_buffer) else {
+        return JNI_FALSE;
+    };
+    let Ok(output_data) = env.get_direct_buffer_address(&output_byte_buffer) else {
+        return JNI_FALSE;
+    };
+    let Ok(y_capacity) = env.get_direct_buffer_capacity(&y_byte_buffer) else {
+        return JNI_FALSE;
+    };
+    let Ok(u_capacity) = env.get_direct_buffer_capacity(&u_byte_buffer) else {
+        return JNI_FALSE;
+    };
+    let Ok(v_capacity) = env.get_direct_buffer_capacity(&v_byte_buffer) else {
+        return JNI_FALSE;
+    };
+    let Ok(output_capacity) = env.get_direct_buffer_capacity(&output_byte_buffer) else {
+        return JNI_FALSE;
+    };
+
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let chroma_width = (width_usize + 1) / 2;
+    let chroma_height = (height_usize + 1) / 2;
+    let y_required = y_position as usize
+        + (height_usize - 1) * y_row_stride as usize
+        + width_usize;
+    let u_required = u_position as usize
+        + (chroma_height - 1) * u_row_stride as usize
+        + (chroma_width - 1) * u_pixel_stride as usize
+        + 1;
+    let v_required = v_position as usize
+        + (chroma_height - 1) * v_row_stride as usize
+        + (chroma_width - 1) * v_pixel_stride as usize
+        + 1;
+    let output_len = width_usize * height_usize * 4;
+    if y_capacity < y_required
+        || u_capacity < u_required
+        || v_capacity < v_required
+        || output_capacity < output_len
+    {
+        return JNI_FALSE;
+    }
+
+    let mut temporary_u = Vec::new();
+    let mut temporary_v = Vec::new();
+    let (u_plane, v_plane, output_u_stride, output_v_stride) =
+        if u_pixel_stride == 1 && v_pixel_stride == 1 {
+            (
+                unsafe { u_data.add(u_position as usize) as *const u8 },
+                unsafe { v_data.add(v_position as usize) as *const u8 },
+                u_row_stride,
+                v_row_stride,
+            )
+        } else {
+            temporary_u.resize(chroma_width * chroma_height, 128);
+            temporary_v.resize(chroma_width * chroma_height, 128);
+            for row in 0..chroma_height {
+                for column in 0..chroma_width {
+                    let target = row * chroma_width + column;
+                    let u_source = u_position as usize
+                        + row * u_row_stride as usize
+                        + column * u_pixel_stride as usize;
+                    let v_source = v_position as usize
+                        + row * v_row_stride as usize
+                        + column * v_pixel_stride as usize;
+                    temporary_u[target] = unsafe { *u_data.add(u_source) };
+                    temporary_v[target] = unsafe { *v_data.add(v_source) };
+                }
+            }
+            (
+                temporary_u.as_ptr(),
+                temporary_v.as_ptr(),
+                chroma_width as jint,
+                chroma_width as jint,
+            )
+        };
+
+    let result = unsafe {
+        crate::I420ToABGR(
+            y_data.add(y_position as usize) as *const u8,
+            y_row_stride,
+            u_plane,
+            output_u_stride,
+            v_plane,
+            output_v_stride,
+            output_data,
+            width * 4,
+            width,
+            height,
+        )
+    };
+    if result == 0 {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_ffi_FFI_onAudioFrameUpdate(
     env: JNIEnv,
     _class: JClass,
@@ -412,6 +553,29 @@ pub fn clear_codec_info() {
         })?;
 */
 pub fn call_main_service_pointer_input(kind: &str, mask: i32, x: i32, y: i32) -> JniResult<()> {
+    let scale_opt = hbb_common::config::Config::get_option("mdm-scale-resolution-down-by");
+    let scale = scale_opt.trim().parse::<f64>().unwrap_or(1.0).max(1.0);
+    let (mapped_x, mapped_y) = if scale > 1.001 {
+        let orig_size = crate::SCREEN_SIZE.lock().unwrap();
+        let orig_w = orig_size.0 as f64;
+        let orig_h = orig_size.1 as f64;
+        if orig_w > 0.0 && orig_h > 0.0 {
+            let mut w = (orig_w / scale) as usize;
+            let mut h = (orig_h / scale) as usize;
+            w = (w / 2) * 2;
+            h = (h / 2) * 2;
+            w = w.max(16);
+            h = h.max(16);
+            let ratio_x = orig_w / w as f64;
+            let ratio_y = orig_h / h as f64;
+            ((x as f64 * ratio_x) as i32, (y as f64 * ratio_y) as i32)
+        } else {
+            (x, y)
+        }
+    } else {
+        (x, y)
+    };
+
     if let (Some(jvm), Some(ctx)) = (
         JVM.read().unwrap().as_ref(),
         MAIN_SERVICE_CTX.read().unwrap().as_ref(),
@@ -425,8 +589,8 @@ pub fn call_main_service_pointer_input(kind: &str, mask: i32, x: i32, y: i32) ->
             &[
                 JValue::Int(kind),
                 JValue::Int(mask),
-                JValue::Int(x),
-                JValue::Int(y),
+                JValue::Int(mapped_x),
+                JValue::Int(mapped_y),
             ],
         )?;
         return Ok(());
