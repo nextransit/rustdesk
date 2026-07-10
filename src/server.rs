@@ -81,6 +81,12 @@ pub mod printer_service;
 pub type Childs = Arc<Mutex<Vec<std::process::Child>>>;
 type ConnMap = HashMap<i32, ConnInner>;
 
+#[derive(Clone, Default)]
+pub struct ConnectionMeta {
+    pub control_permissions: Option<ControlPermissions>,
+    pub controlled_context: Option<ControlledContext>,
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const CONFIG_SYNC_INTERVAL_SECS: f32 = 0.3;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -163,7 +169,7 @@ async fn accept_connection_(
     server: ServerPtr,
     socket: Stream,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     #[cfg(target_os = "android")]
     android_log("rustdesk_conn", &format!("accept_connection_ entered secure={}", secure));
@@ -182,7 +188,7 @@ async fn accept_connection_(
             Stream::from(stream, stream_addr),
             addr,
             secure,
-            control_permissions,
+            meta,
         )
         .await?;
     }
@@ -194,7 +200,7 @@ pub async fn create_tcp_connection(
     stream: Stream,
     addr: SocketAddr,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     let mut stream = stream;
     let id = server.write().unwrap().get_new_id();
@@ -264,14 +270,7 @@ pub async fn create_tcp_connection(
     }
     #[cfg(target_os = "android")]
     android_log("rustdesk_conn", &format!("accept_connection calling Connection::start id={} addr={} secure={}", id, addr, secure));
-    Connection::start(
-        addr,
-        stream,
-        id,
-        Arc::downgrade(&server),
-        control_permissions,
-    )
-    .await;
+    Connection::start(addr, stream, id, Arc::downgrade(&server), meta).await;
     Ok(())
 }
 
@@ -280,9 +279,9 @@ pub async fn accept_connection(
     socket: Stream,
     peer_addr: SocketAddr,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) {
-    if let Err(err) = accept_connection_(server, socket, secure, control_permissions).await {
+    if let Err(err) = accept_connection_(server, socket, secure, meta).await {
         log::warn!("Failed to accept connection from {}: {}", peer_addr, err);
     }
 }
@@ -294,7 +293,7 @@ pub async fn create_relay_connection(
     peer_addr: SocketAddr,
     secure: bool,
     ipv4: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) {
     #[cfg(target_os = "android")]
     android_log("rustdesk_conn", &format!("create_relay_connection peer={} relay={} uuid={}", peer_addr, relay_server, uuid));
@@ -305,7 +304,7 @@ pub async fn create_relay_connection(
         peer_addr,
         secure,
         ipv4,
-        control_permissions,
+        meta,
     )
     .await
     {
@@ -325,7 +324,7 @@ async fn create_relay_connection_(
     peer_addr: SocketAddr,
     secure: bool,
     ipv4: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
@@ -340,7 +339,7 @@ async fn create_relay_connection_(
         ..Default::default()
     });
     stream.send(&msg_out).await?;
-    create_tcp_connection(server, stream, peer_addr, secure, control_permissions).await?;
+    create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
     Ok(())
 }
 
