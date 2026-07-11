@@ -3081,8 +3081,11 @@ pub mod server_side {
         sys::{jboolean, jstring},
         JNIEnv,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::start_server;
+
+    static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
     #[no_mangle]
     pub unsafe extern "system" fn Java_ffi_FFI_startServer(
@@ -3101,6 +3104,15 @@ pub mod server_side {
                 let custom_client_config: String = custom_client_config.into();
                 crate::read_custom_client(&custom_client_config);
             }
+        }
+        if SERVER_STARTED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            log::info!("MDM startServer reused existing server for JVM request");
+            crate::rendezvous_mediator::reset_needs_deploy_notification();
+            crate::rendezvous_mediator::RendezvousMediator::restart();
+            return;
         }
         std::thread::spawn(move || start_server(true));
     }
