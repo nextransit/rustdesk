@@ -304,6 +304,11 @@ class MainService : Service() {
         private val captureDroppedFrameCount = AtomicLong(0)
         private val captureDuplicateFrameCount = AtomicLong(0)
         private val captureErrorCount = AtomicLong(0)
+        private val mdmDecoderInputCount = AtomicLong(0)
+        private val mdmDecoderOutputCount = AtomicLong(0)
+        private val mdmDecoderInputWaitCount = AtomicLong(0)
+        private val mdmRgbaConversionNanos = AtomicLong(0)
+        private val mdmJniSubmitNanos = AtomicLong(0)
         @Volatile private var captureStartedAtMs = 0L
         @Volatile private var captureLastFrameAtMs = 0L
         @Volatile private var captureLastStatsLogAtMs = 0L
@@ -387,7 +392,13 @@ class MainService : Service() {
             captureFrameCount.set(0)
             captureByteCount.set(0)
             captureDroppedFrameCount.set(0)
+            captureDuplicateFrameCount.set(0)
             captureErrorCount.set(0)
+            mdmDecoderInputCount.set(0)
+            mdmDecoderOutputCount.set(0)
+            mdmDecoderInputWaitCount.set(0)
+            mdmRgbaConversionNanos.set(0)
+            mdmJniSubmitNanos.set(0)
             captureStartedAtMs = now
             captureLastFrameAtMs = 0L
             captureLastStatsLogAtMs = now
@@ -420,9 +431,17 @@ class MainService : Service() {
                         "bytes=$bytes delta_bytes=$deltaBytes window_fps=${deltaFrames * 1000.0 / deltaMs} " +
                         "avg_fps=$captureAverageFps last_frame_age_ms=$captureLastFrameAgeMs " +
                         "dropped=${captureDroppedFrameCount.get()} errors=${captureErrorCount.get()} " +
+                        "decoder_in=${mdmDecoderInputCount.get()} decoder_out=${mdmDecoderOutputCount.get()} " +
+                        "decoder_input_wait=${mdmDecoderInputWaitCount.get()} " +
+                        "rgba_avg_ms=${averageStageMs(mdmRgbaConversionNanos.get(), mdmDecoderOutputCount.get())} " +
+                        "jni_avg_ms=${averageStageMs(mdmJniSubmitNanos.get(), frames)} " +
                         "width=$captureWidth height=$captureHeight scale=${SCREEN_INFO.scale}"
                 )
             }
+        }
+
+        private fun averageStageMs(totalNanos: Long, count: Long): Double {
+            return if (count > 0L) totalNanos / count / 1_000_000.0 else 0.0
         }
 
         fun recordCaptureDroppedFrame(reason: String) {
@@ -535,6 +554,8 @@ class MainService : Service() {
     private var mdmPendingBootstrapFrame: ByteBuffer? = null
     private var mdmKeepaliveFrameCount = 0L
     private var mdmRgbaScratch: ByteBuffer? = null
+    private var mdmLastFrameScratch: ByteBuffer? = null
+    private var mdmPendingFrameScratch: ByteBuffer? = null
 
     private data class MdmFeedBootstrap(
         val nalUnits: List<ByteArray>,
@@ -1452,6 +1473,8 @@ class MainService : Service() {
             mdmPendingBootstrapFrame = null
             mdmKeepaliveFrameCount = 0L
             mdmRgbaScratch = null
+            mdmLastFrameScratch = null
+            mdmPendingFrameScratch = null
 
             _isStart = true
             _isReady = true
@@ -1639,6 +1662,12 @@ class MainService : Service() {
                                 "reason=$openReason bootstrap_nals=${bootstrap.nalUnits.size} " +
                                 "tail_bytes=${bootstrap.pendingBytes.size}"
                         )
+                        if (bootstrap.nalUnits.isEmpty()) {
+                            mdmBootstrapInProgress = true
+                            mdmPendingBootstrapFrame = null
+                            Thread.sleep(20L)
+                            continue
+                        }
                         mdmBootstrapInProgress = true
                         mdmPendingBootstrapFrame = null
                         for (nalUnit in bootstrap.nalUnits) {
@@ -1731,13 +1760,16 @@ class MainService : Service() {
         val nalUnits = parsed.first
         val idrIndex = nalUnits.indexOfLast { mdmH264NalType(it) == 5 }
         if (idrIndex < 0) {
-            return MdmFeedBootstrap(emptyList(), parsed.second, currentLength)
+            return MdmFeedBootstrap(emptyList(), bytes, currentLength)
         }
         val spsIndex = (idrIndex downTo 0).firstOrNull { mdmH264NalType(nalUnits[it]) == 7 }
         val ppsIndex = (idrIndex downTo 0).firstOrNull { mdmH264NalType(nalUnits[it]) == 8 }
+        if (spsIndex == null || ppsIndex == null) {
+            return MdmFeedBootstrap(emptyList(), bytes, currentLength)
+        }
         val selected = ArrayList<ByteArray>()
-        spsIndex?.let { selected.add(nalUnits[it]) }
-        ppsIndex?.let { selected.add(nalUnits[it]) }
+        selected.add(nalUnits[spsIndex])
+        selected.add(nalUnits[ppsIndex])
         selected.addAll(nalUnits.subList(idrIndex, nalUnits.size))
         return MdmFeedBootstrap(selected, parsed.second, currentLength)
     }
@@ -1752,7 +1784,10 @@ class MainService : Service() {
 
     private fun queueMdmDecoderInput(decoder: MediaCodec, nalUnit: ByteArray, presentationTimeUs: Long): Boolean {
         val inputIndex = decoder.dequeueInputBuffer(5000)
-        if (inputIndex < 0) return false
+        if (inputIndex < 0) {
+            mdmDecoderInputWaitCount.incrementAndGet()
+            return false
+        }
         val inputBuffer = decoder.getInputBuffer(inputIndex)
         if (inputBuffer == null) {
             decoder.queueInputBuffer(inputIndex, 0, 0, presentationTimeUs, 0)
@@ -1767,6 +1802,7 @@ class MainService : Service() {
         }
         inputBuffer.put(nalUnit)
         decoder.queueInputBuffer(inputIndex, 0, nalUnit.size, presentationTimeUs, 0)
+        mdmDecoderInputCount.incrementAndGet()
         return true
     }
 
@@ -1788,15 +1824,20 @@ class MainService : Service() {
                             ) {
                                 continue
                             }
+                            val conversionStartedAtNs = System.nanoTime()
                             val rgbaBuffer = mdmDecoderOutputToRgba(decoder, outputIndex, bufferInfo)
+                            mdmRgbaConversionNanos.addAndGet(System.nanoTime() - conversionStartedAtNs)
                             if (rgbaBuffer != null) {
+                                mdmDecoderOutputCount.incrementAndGet()
                                 rgbaBuffer.rewind()
                                 val byteCount = rgbaBuffer.remaining()
-                                val frame = copyMdmRgbaFrame(rgbaBuffer)
+                                val frame = copyMdmRgbaFrame(rgbaBuffer, suppressCurrentOutput)
                                 if (suppressCurrentOutput) {
                                     mdmPendingBootstrapFrame = frame
                                 } else {
+                                    val submitStartedAtNs = System.nanoTime()
                                     FFI.onVideoFrameUpdate(rgbaBuffer)
+                                    mdmJniSubmitNanos.addAndGet(System.nanoTime() - submitStartedAtNs)
                                     mdmLastRgbaFrame = frame
                                     mdmLastFrameOutputAtMs = now
                                     mdmLastDecodedFramePublishedAtMs = now
@@ -1829,7 +1870,9 @@ class MainService : Service() {
             return
         }
         val byteCount = frame.remaining()
+        val submitStartedAtNs = System.nanoTime()
         FFI.onVideoFrameUpdate(frame)
+        mdmJniSubmitNanos.addAndGet(System.nanoTime() - submitStartedAtNs)
         mdmLastRgbaFrame = frame.asReadOnlyBuffer().apply { rewind() }
         val now = System.currentTimeMillis()
         mdmLastFrameOutputAtMs = now
@@ -1838,9 +1881,17 @@ class MainService : Service() {
         Log.i(logTag, "mdm bootstrap published latest frame only reason=$reason nals=$bootstrapNalCount")
     }
 
-    private fun copyMdmRgbaFrame(source: ByteBuffer): ByteBuffer {
+    private fun copyMdmRgbaFrame(source: ByteBuffer, pending: Boolean): ByteBuffer {
         val input = source.duplicate().apply { rewind() }
-        return ByteBuffer.allocateDirect(input.remaining()).apply {
+        val requiredBytes = input.remaining()
+        val current = if (pending) mdmPendingFrameScratch else mdmLastFrameScratch
+        val target = current
+            ?.takeIf { it.capacity() == requiredBytes }
+            ?: ByteBuffer.allocateDirect(requiredBytes).also {
+                if (pending) mdmPendingFrameScratch = it else mdmLastFrameScratch = it
+            }
+        target.clear()
+        return target.apply {
             put(input)
             flip()
         }.asReadOnlyBuffer()
@@ -1856,7 +1907,9 @@ class MainService : Service() {
         }
         val frame = mdmLastRgbaFrame?.duplicate()?.apply { rewind() } ?: return
         val byteCount = frame.remaining()
+        val submitStartedAtNs = System.nanoTime()
         FFI.onVideoFrameUpdate(frame)
+        mdmJniSubmitNanos.addAndGet(System.nanoTime() - submitStartedAtNs)
         mdmLastFrameOutputAtMs = now
         mdmKeepaliveFrameCount += 1
         captureDuplicateFrameCount.incrementAndGet()
@@ -1912,7 +1965,11 @@ class MainService : Service() {
             position(0)
             limit(capacity())
         }
-        val rgbaBuffer = ByteBuffer.allocateDirect(imageWidth * imageHeight * 4)
+        val requiredBytes = imageWidth * imageHeight * 4
+        val rgbaBuffer = mdmRgbaScratch
+            ?.takeIf { it.capacity() == requiredBytes }
+            ?: ByteBuffer.allocateDirect(requiredBytes).also { mdmRgbaScratch = it }
+        rgbaBuffer.clear()
         val baseOffset = bufferInfo.offset.coerceAtLeast(0)
         val lumaPlaneSize = stride * sliceHeight
         val semiPlanar = colorFormat != MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar &&
@@ -2056,6 +2113,8 @@ class MainService : Service() {
         mdmPendingBootstrapFrame = null
         mdmKeepaliveFrameCount = 0L
         mdmRgbaScratch = null
+        mdmLastFrameScratch = null
+        mdmPendingFrameScratch = null
         if (decoderStarted) {
             try {
                 decoder?.stop()
