@@ -18,6 +18,12 @@ pub struct Capturer {
 }
 
 fn get_scale() -> f64 {
+    if call_main_service_get_by_name("capture_source")
+        .map(|source| source == "mdm_screenrecord")
+        .unwrap_or(false)
+    {
+        return 1.0;
+    }
     hbb_common::config::Config::get_option("mdm-scale-resolution-down-by")
         .trim()
         .parse::<f64>()

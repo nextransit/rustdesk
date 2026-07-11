@@ -553,8 +553,18 @@ pub fn clear_codec_info() {
         })?;
 */
 pub fn call_main_service_pointer_input(kind: &str, mask: i32, x: i32, y: i32) -> JniResult<()> {
-    let scale_opt = hbb_common::config::Config::get_option("mdm-scale-resolution-down-by");
-    let scale = scale_opt.trim().parse::<f64>().unwrap_or(1.0).max(1.0);
+    let managed_screenrecord = call_main_service_get_by_name("capture_source")
+        .map(|source| source == "mdm_screenrecord")
+        .unwrap_or(false);
+    let scale = if managed_screenrecord {
+        1.0
+    } else {
+        hbb_common::config::Config::get_option("mdm-scale-resolution-down-by")
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(1.0)
+            .max(1.0)
+    };
     let (mapped_x, mapped_y) = if scale > 1.001 {
         let orig_size = crate::SCREEN_SIZE.lock().unwrap();
         let orig_w = orig_size.0 as f64;

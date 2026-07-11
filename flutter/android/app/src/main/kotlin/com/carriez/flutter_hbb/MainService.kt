@@ -105,12 +105,9 @@ class MainService : Service() {
     }
 
     private fun mapRemoteInputToScreen(x: Int, y: Int): Pair<Int, Int> {
-        if (captureSourceValue != CAPTURE_SOURCE_MDM_SCREENRECORD || mdmCaptureWidth <= 0 || mdmCaptureHeight <= 0) {
-            return Pair(x, y)
-        }
-        val mappedX = (x.toDouble() * SCREEN_INFO.width.toDouble() / mdmCaptureWidth.toDouble()).toInt()
-        val mappedY = (y.toDouble() * SCREEN_INFO.height.toDouble() / mdmCaptureHeight.toDouble()).toInt()
-        return Pair(mappedX, mappedY)
+        val maxX = (SCREEN_INFO.width - 1).coerceAtLeast(0)
+        val maxY = (SCREEN_INFO.height - 1).coerceAtLeast(0)
+        return Pair(x.coerceIn(0, maxX), y.coerceIn(0, maxY))
     }
 
     @Keep
