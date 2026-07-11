@@ -145,6 +145,7 @@ class MainService : Service() {
             "is_start" -> {
                 isStart.toString()
             }
+            "capture_source" -> captureSourceValue
             else -> ""
         }
     }
@@ -1535,8 +1536,9 @@ class MainService : Service() {
     }
 
     private fun yuv420ImageToRgba(image: Image): ByteBuffer {
-        val imageWidth = image.width
-        val imageHeight = image.height
+        val cropRect = image.cropRect
+        val imageWidth = cropRect.width()
+        val imageHeight = cropRect.height()
         val yPlane = image.planes[0]
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
@@ -1549,6 +1551,12 @@ class MainService : Service() {
             ?: ByteBuffer.allocateDirect(requiredBytes).also { mdmRgbaScratch = it }
         rgbaBuffer.clear()
 
+        val yOffset = yBuffer.position() + cropRect.top * yPlane.rowStride + cropRect.left * yPlane.pixelStride
+        val chromaTop = cropRect.top / 2
+        val chromaLeft = cropRect.left / 2
+        val uOffset = uBuffer.position() + chromaTop * uPlane.rowStride + chromaLeft * uPlane.pixelStride
+        val vOffset = vBuffer.position() + chromaTop * vPlane.rowStride + chromaLeft * vPlane.pixelStride
+
         if (FFI.convertYuv420ToRgba(
                 yBuffer,
                 uBuffer,
@@ -1556,9 +1564,9 @@ class MainService : Service() {
                 rgbaBuffer,
                 imageWidth,
                 imageHeight,
-                yBuffer.position(),
-                uBuffer.position(),
-                vBuffer.position(),
+                yOffset,
+                uOffset,
+                vOffset,
                 yPlane.rowStride,
                 uPlane.rowStride,
                 vPlane.rowStride,
@@ -1575,9 +1583,9 @@ class MainService : Service() {
             val uvRowIndex = rowIndex / 2
             for (columnIndex in 0 until imageWidth) {
                 val uvColumnIndex = columnIndex / 2
-                val yIndex = rowIndex * yPlane.rowStride + columnIndex * yPlane.pixelStride
-                val uIndex = uvRowIndex * uPlane.rowStride + uvColumnIndex * uPlane.pixelStride
-                val vIndex = uvRowIndex * vPlane.rowStride + uvColumnIndex * vPlane.pixelStride
+                val yIndex = yOffset + rowIndex * yPlane.rowStride + columnIndex * yPlane.pixelStride
+                val uIndex = uOffset + uvRowIndex * uPlane.rowStride + uvColumnIndex * uPlane.pixelStride
+                val vIndex = vOffset + uvRowIndex * vPlane.rowStride + uvColumnIndex * vPlane.pixelStride
 
                 val yValue = yBuffer.get(yIndex).toInt() and 0xff
                 val uValue = uBuffer.get(uIndex).toInt() and 0xff
@@ -1876,7 +1884,7 @@ class MainService : Service() {
         } catch (e: Throwable) {
             if (!mdmDecoderOutputImageUnavailableLogged) {
                 mdmDecoderOutputImageUnavailableLogged = true
-                Log.w(logTag, "mdm decoder output Image unavailable, using ByteBuffer fallback: ${e.message}")
+                Log.w(logTag, "mdm decoder output unavailable: ${e.message}")
             }
         }
         val outputBuffer = decoder.getOutputBuffer(outputIndex) ?: return null
