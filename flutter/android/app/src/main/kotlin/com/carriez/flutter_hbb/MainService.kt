@@ -1509,6 +1509,15 @@ class MainService : Service() {
             ?: Pair(SCREEN_INFO.width, SCREEN_INFO.height)
     }
 
+    private fun readMdmScreenrecordGeneration(): Long {
+        return try {
+            val metaFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen_meta.json")
+            if (!metaFile.exists()) -1L else JSONObject(metaFile.readText()).optLong("generation", -1L)
+        } catch (_: Throwable) {
+            -1L
+        }
+    }
+
     private fun createMdmScreenrecordDecoder(): MediaCodec {
         return try {
             MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also {
@@ -1639,20 +1648,44 @@ class MainService : Service() {
             var presentationTimeUs = 0L
             var suppressOutputThroughUs: Long? = null
             var stream: java.io.RandomAccessFile? = null
+            var streamGeneration = -1L
+            var lastGenerationCheckAtMs = 0L
             try {
                 while (isStart && mdmDecoder === decoder) {
                     drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
                     if (!screenFile.exists()) {
+                        runCatching { stream?.close() }
+                        stream = null
+                        streamOffset = 0L
+                        pendingBytes = ByteArray(0)
+                        streamGeneration = -1L
                         Thread.sleep(20)
                         continue
                     }
                     val currentLength = screenFile.length()
+                    val now = System.currentTimeMillis()
+                    val currentGeneration = if (now - lastGenerationCheckAtMs >= 250L) {
+                        lastGenerationCheckAtMs = now
+                        readMdmScreenrecordGeneration()
+                    } else {
+                        streamGeneration
+                    }
+                    val generationChanged = stream != null &&
+                        currentGeneration >= 0L &&
+                        streamGeneration >= 0L &&
+                        currentGeneration != streamGeneration
                     if (stream == null ||
-                        currentLength < streamOffset
+                        currentLength < streamOffset ||
+                        generationChanged
                     ) {
-                        val openReason = if (stream == null) "initial" else "truncated"
+                        val openReason = when {
+                            stream == null -> "initial"
+                            generationChanged -> "generation_changed"
+                            else -> "truncated"
+                        }
                         runCatching { stream?.close() }
                         stream = java.io.RandomAccessFile(screenFile, "r")
+                        streamGeneration = currentGeneration
                         val bootstrap = readMdmFeedBootstrap(stream, currentLength)
                         streamOffset = bootstrap.streamOffset
                         pendingBytes = bootstrap.pendingBytes
@@ -1724,6 +1757,13 @@ class MainService : Service() {
                 if (isStart) {
                     Log.w(logTag, "mdm h264 feed error: ${e.message}", e)
                     recordCaptureError(Exception(e))
+                    Thread({
+                        Thread.sleep(500L)
+                        if (isStart && mdmDecoder === decoder) {
+                            Log.w(logTag, "mdm h264 feed scheduling decoder recovery")
+                            switchToMdmSystemScreenrecordCapture("feed_thread_error", forceRestart = true)
+                        }
+                    }, "mdm-screenrecord-feed-recovery").start()
                 }
             } finally {
                 runCatching { stream?.close() }
