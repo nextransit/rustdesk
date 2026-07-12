@@ -28,6 +28,7 @@ private const val AUDIO_FRAMES_PER_OPUS_BATCH = 480
 private const val AUDIO_NOISE_GATE_THRESHOLD = 0.0002f
 private const val SYSTEM_AUDIO_FRAME_BYTES = AUDIO_SAMPLE_RATE * AUDIO_OUTPUT_CHANNELS * 2 / 50
 private const val SYSTEM_AUDIO_MAX_BACKLOG_BYTES = SYSTEM_AUDIO_FRAME_BYTES * 10L
+private const val SYSTEM_AUDIO_MAX_STALE_MS = 3_000L
 private const val SYSTEM_AUDIO_PATH =
     "/sdcard/Android/data/com.decard.mdm.agent/files/system_audio.pcm"
 
@@ -94,6 +95,16 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                     sourceLabel = "AudioPlaybackCaptureConfiguration"
                 )
             }
+            requests += AudioRecorderRequest(
+                mode = "mic_fallback",
+                source = MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                sourceLabel = "VOICE_COMMUNICATION"
+            )
+            requests += AudioRecorderRequest(
+                mode = "mic_fallback",
+                source = MediaRecorder.AudioSource.MIC,
+                sourceLabel = "MIC"
+            )
         }
 
         for (request in requests) {
@@ -347,13 +358,20 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
     private fun configureSystemPlaybackFile(): Boolean {
         val audioFile = File(SYSTEM_AUDIO_PATH)
         val readyDeadline = System.currentTimeMillis() + 2_000L
-        while (System.currentTimeMillis() < readyDeadline &&
-            (!audioFile.exists() || audioFile.length() < SYSTEM_AUDIO_FRAME_BYTES)
-        ) {
+        while (System.currentTimeMillis() < readyDeadline && !isSystemPlaybackFileReady(audioFile)) {
             Thread.sleep(20L)
         }
         if (!audioFile.exists()) {
             Log.w(logTag, "MDM-AudioPlaybackUnavailable reason=system_audio_file_missing")
+            return false
+        }
+        if (audioFile.length() < SYSTEM_AUDIO_FRAME_BYTES) {
+            Log.w(logTag, "MDM-AudioPlaybackUnavailable reason=system_audio_file_empty bytes=${audioFile.length()}")
+            return false
+        }
+        val staleMs = System.currentTimeMillis() - audioFile.lastModified()
+        if (staleMs > SYSTEM_AUDIO_MAX_STALE_MS) {
+            Log.w(logTag, "MDM-AudioPlaybackUnavailable reason=system_audio_file_stale stale_ms=$staleMs")
             return false
         }
         recorderMode = "system_playback_file"
@@ -368,6 +386,13 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
                 "output_channels=$AUDIO_OUTPUT_CHANNELS encoding=PCM_S16LE frame_bytes=$SYSTEM_AUDIO_FRAME_BYTES"
         )
         return true
+    }
+
+    private fun isSystemPlaybackFileReady(audioFile: File): Boolean {
+        if (!audioFile.exists() || audioFile.length() < SYSTEM_AUDIO_FRAME_BYTES) {
+            return false
+        }
+        return System.currentTimeMillis() - audioFile.lastModified() <= SYSTEM_AUDIO_MAX_STALE_MS
     }
 
     private fun startSystemPlaybackFileReader(): Boolean {
