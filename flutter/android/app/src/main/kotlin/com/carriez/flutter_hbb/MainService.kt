@@ -1520,13 +1520,13 @@ class MainService : Service() {
 
     private fun createMdmScreenrecordDecoder(): MediaCodec {
         return try {
-            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also {
-                Log.i(logTag, "mdm screenrecord decoder selected: ${it.name}")
+            MediaCodec.createByCodecName(MDM_SOFTWARE_AVC_DECODER).also {
+                Log.i(logTag, "mdm screenrecord software decoder selected: ${it.name}")
             }
         } catch (e: Throwable) {
-            Log.w(logTag, "default AVC decoder unavailable; falling back to software: ${e.message}")
-            MediaCodec.createByCodecName(MDM_SOFTWARE_AVC_DECODER).also {
-                Log.i(logTag, "mdm screenrecord decoder selected: $MDM_SOFTWARE_AVC_DECODER")
+            Log.w(logTag, "software AVC decoder unavailable; falling back to default: ${e.message}")
+            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also {
+                Log.i(logTag, "mdm screenrecord fallback decoder selected: ${it.name}")
             }
         }
     }
@@ -1650,6 +1650,7 @@ class MainService : Service() {
             var stream: java.io.RandomAccessFile? = null
             var streamGeneration = -1L
             var lastGenerationCheckAtMs = 0L
+            var lastBootstrapWaitLogAtMs = 0L
             try {
                 while (isStart && mdmDecoder === decoder) {
                     drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
@@ -1689,18 +1690,31 @@ class MainService : Service() {
                         val bootstrap = readMdmFeedBootstrap(stream, currentLength)
                         streamOffset = bootstrap.streamOffset
                         pendingBytes = bootstrap.pendingBytes
+                        if (bootstrap.nalUnits.isEmpty()) {
+                            mdmBootstrapInProgress = true
+                            mdmPendingBootstrapFrame = null
+                            val waitNow = System.currentTimeMillis()
+                            if (waitNow - lastBootstrapWaitLogAtMs >= 1_000L) {
+                                lastBootstrapWaitLogAtMs = waitNow
+                                Log.w(
+                                    logTag,
+                                    "mdm h264 bootstrap unavailable; waiting for fresh screenrecord generation " +
+                                        "size=$currentLength generation=$currentGeneration reason=$openReason"
+                                )
+                            }
+                            runCatching { stream?.close() }
+                            stream = null
+                            streamOffset = 0L
+                            pendingBytes = ByteArray(0)
+                            Thread.sleep(100L)
+                            continue
+                        }
                         Log.i(
                             logTag,
                             "mdm h264 feed opened: size=$currentLength modified=${screenFile.lastModified()} " +
                                 "reason=$openReason bootstrap_nals=${bootstrap.nalUnits.size} " +
                                 "tail_bytes=${bootstrap.pendingBytes.size}"
                         )
-                        if (bootstrap.nalUnits.isEmpty()) {
-                            mdmBootstrapInProgress = true
-                            mdmPendingBootstrapFrame = null
-                            Thread.sleep(20L)
-                            continue
-                        }
                         mdmBootstrapInProgress = true
                         mdmPendingBootstrapFrame = null
                         for (nalUnit in bootstrap.nalUnits) {

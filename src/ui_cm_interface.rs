@@ -304,11 +304,23 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             .next()
             .is_none()
         {
-            if let Err(e) =
-                scrap::android::call_main_service_set_by_name("stop_capture", None, None)
-            {
-                log::debug!("stop_capture err:{}", e);
-            }
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(1_000));
+                let has_active_remote_client = CLIENTS
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|(_id, client)| !client.is_file_transfer && !client.is_terminal);
+                if has_active_remote_client {
+                    log::info!("skip delayed stop_capture because a remote client reconnected");
+                    return;
+                }
+                if let Err(e) =
+                    scrap::android::call_main_service_set_by_name("stop_capture", None, None)
+                {
+                    log::debug!("stop_capture err:{}", e);
+                }
+            });
         }
 
         self.ui_handler.remove_connection(id, close);
