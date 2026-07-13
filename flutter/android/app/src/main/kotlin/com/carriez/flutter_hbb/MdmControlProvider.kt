@@ -14,6 +14,8 @@ import android.os.Build
 import android.util.Log
 import ffi.FFI
 import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MdmControlProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
@@ -37,6 +39,7 @@ class MdmControlProvider : ContentProvider() {
                 METHOD_STOP_SERVICE -> stopService()
                 METHOD_SERVICE_STATUS -> serviceStatus()
                 METHOD_GET_IDENTITY -> getIdentity()
+                METHOD_ACCEPT_WEBRTC_OFFER -> acceptWebRtcOffer(extras)
                 else -> Bundle().apply {
                     putBoolean(KEY_SUCCESS, false)
                     putString(KEY_ERROR, "unknown method: $method")
@@ -76,6 +79,7 @@ class MdmControlProvider : ContentProvider() {
         val hbbr = extras?.getString(EXTRA_HBBR)?.trim().orEmpty()
         val key = extras?.getString(EXTRA_KEY)?.trim().orEmpty()
         val audioEnabled = extras?.getBoolean(EXTRA_AUDIO_ENABLED, false) ?: false
+        val startServer = extras?.getBoolean(EXTRA_START_SERVER, true) ?: true
         require(hbbs.isNotBlank()) { "hbbs is required" }
         require(hbbr.isNotBlank()) { "hbbr is required" }
 
@@ -89,6 +93,7 @@ class MdmControlProvider : ContentProvider() {
             "relay-server" to hbbr,
             "key" to key
         )
+        options.putAll(managedWebRtcOptions(extras))
         if (extras?.containsKey(EXTRA_MAX_FPS) == true) {
             options.putAll(managedStreamOptions(extras))
         }
@@ -109,13 +114,245 @@ class MdmControlProvider : ContentProvider() {
                 "codec=${options["mdm-codec-preference"].orEmpty()} " +
                 "fps=${options["mdm-max-fps"].orEmpty()} " +
                 "bitrate=${options["mdm-max-bitrate-bps"].orEmpty()} " +
+                "webrtc=${options["mdm-webrtc-transport"].orEmpty()} " +
+                "icePolicy=${options["mdm-webrtc-ice-transport"].orEmpty()} " +
                 "audio=$audioEnabled runtimeAudioApplied=$runtimeAudioApplied"
         )
-        Log.i(TAG, "MDM-debug FFI.startServer called")
-        FFI.startServer(appDir.absolutePath, "")
-        val myId = FFI.getMyId(appDir.absolutePath)
-        Log.i(TAG, "MDM-debug FFI.startServer done getMyId=$myId")
-        return success(File(appDir, RUSTDESK2_TOML))
+        if (startServer) {
+            Log.i(TAG, "MDM-debug FFI.startServer called")
+            FFI.startServer(appDir.absolutePath, "")
+            val myId = FFI.getMyId(appDir.absolutePath)
+            Log.i(TAG, "MDM-debug FFI.startServer done getMyId=$myId")
+        } else {
+            Log.i(TAG, "MDM-debug FFI.startServer skipped reason=config_refresh")
+        }
+        return success(File(appDir, RUSTDESK2_TOML)).apply {
+            putString(KEY_STATUS_WEBRTC_CAPABILITIES, webRtcCapabilities(appDir))
+        }
+    }
+
+    private fun acceptWebRtcOffer(extras: Bundle?): Bundle {
+        val offerEndpoint = extras?.getString(EXTRA_WEBRTC_OFFER_ENDPOINT)?.trim().orEmpty()
+        require(offerEndpoint.startsWith("webrtc://")) { "invalid WebRTC offer endpoint" }
+        val answerEndpoint = FFI.acceptWebRtcOffer(configDir().absolutePath, offerEndpoint)
+        require(answerEndpoint.startsWith("webrtc://")) { answerEndpoint.ifBlank { "empty WebRTC answer" } }
+        return success(File(configDir(), RUSTDESK2_TOML)).apply {
+            putString(KEY_WEBRTC_ANSWER_ENDPOINT, answerEndpoint)
+        }
+    }
+
+    private fun managedWebRtcOptions(extras: Bundle?): LinkedHashMap<String, String> {
+        val options = linkedMapOf<String, String>()
+        if (extras == null) {
+            return options
+        }
+
+        val iceServersKey = firstPresentKey(
+            extras,
+            EXTRA_WEBRTC_ICE_SERVERS,
+            EXTRA_ICE_SERVERS_JSON,
+            EXTRA_ICE_SERVERS
+        )
+        if (iceServersKey != null) {
+            options["ice-servers"] = normalizeIceServers(
+                extras.getString(iceServersKey).orEmpty()
+            )
+            options["mdm-webrtc-allow-default-stun"] = "N"
+        }
+
+        val requestedTransport = when {
+            extras.containsKey(EXTRA_WEBRTC_TRANSPORT) ->
+                extras.getString(EXTRA_WEBRTC_TRANSPORT).orEmpty()
+            extras.containsKey(EXTRA_TRANSPORT_PREFERENCE) ->
+                extras.getString(EXTRA_TRANSPORT_PREFERENCE).orEmpty()
+            extras.containsKey(EXTRA_SESSION_TRANSPORT) ->
+                extras.getString(EXTRA_SESSION_TRANSPORT).orEmpty()
+            extras.containsKey(EXTRA_TRANSPORT) -> extras.getString(EXTRA_TRANSPORT).orEmpty()
+            else -> ""
+        }.trim().lowercase()
+        val transport = when (requestedTransport) {
+            "disabled", "off", "rustdesk", "websocket" -> "disabled"
+            "auto" -> "auto"
+            "datachannel", "data-channel", "datachannel-preferred", "webrtc",
+            "webrtc-first", "webrtc-only", "webrtc-datachannel" -> "datachannel"
+            "media", "media-track", "media-preferred", "webrtc-media" -> "media"
+            "" -> ""
+            else -> throw IllegalArgumentException(
+                "unsupported WebRTC transport preference: $requestedTransport"
+            )
+        }
+        if (transport.isNotEmpty()) {
+            options["mdm-webrtc-transport"] = transport
+        }
+
+        val iceTransportKey = firstPresentKey(
+            extras,
+            EXTRA_WEBRTC_ICE_TRANSPORT,
+            EXTRA_ICE_TRANSPORT_POLICY
+        )
+        if (iceTransportKey != null) {
+            val iceTransport = extras.getString(iceTransportKey)
+                .orEmpty()
+                .trim()
+                .lowercase()
+            options["mdm-webrtc-ice-transport"] = when (iceTransport) {
+                "all", "direct-first" -> "all"
+                "relay", "relay-only" -> "relay"
+                else -> throw IllegalArgumentException(
+                    "unsupported WebRTC ICE transport policy: $iceTransport"
+                )
+            }
+        }
+
+        if (extras.containsKey(EXTRA_WEBRTC_ALLOW_DEFAULT_STUN)) {
+            options["mdm-webrtc-allow-default-stun"] = boolOption(
+                extras.getBoolean(EXTRA_WEBRTC_ALLOW_DEFAULT_STUN, false)
+            )
+        }
+        if (extras.containsKey(EXTRA_WEBRTC_MEDIA_ENABLED)) {
+            options["mdm-webrtc-media-enabled"] = boolOption(
+                extras.getBoolean(EXTRA_WEBRTC_MEDIA_ENABLED, false)
+            )
+        }
+        copyBooleanOption(extras, options, EXTRA_WEBRTC_ENABLED, "mdm-webrtc-enabled")
+        copyBooleanOption(
+            extras,
+            options,
+            EXTRA_WEBRTC_BACKEND_SIGNALING_ENABLED,
+            "mdm-webrtc-backend-signaling-enabled"
+        )
+        copyBooleanOption(
+            extras,
+            options,
+            EXTRA_WEBRTC_DATA_CHANNEL_ENABLED,
+            "mdm-webrtc-data-channel-enabled"
+        )
+        copyBooleanOption(
+            extras,
+            options,
+            EXTRA_WEBRTC_MEDIA_TRACK_ENABLED,
+            "mdm-webrtc-media-enabled"
+        )
+        copyBooleanOption(extras, options, EXTRA_WEBRTC_TURN_ENABLED, "mdm-webrtc-turn-enabled")
+        copyBooleanOption(
+            extras,
+            options,
+            EXTRA_WEBRTC_AUTOMATIC_FALLBACK_ENABLED,
+            "mdm-webrtc-fallback-enabled"
+        )
+        copyBooleanOption(
+            extras,
+            options,
+            EXTRA_WEBRTC_SELF_HEALING_ENABLED,
+            "mdm-webrtc-self-healing-enabled"
+        )
+        if (extras.containsKey(EXTRA_WEBRTC_SIGNALING_MODE)) {
+            val signalingMode = extras.getString(EXTRA_WEBRTC_SIGNALING_MODE)
+                .orEmpty()
+                .trim()
+                .lowercase()
+            require(signalingMode in setOf("backend", "existing-session", "disabled")) {
+                "unsupported WebRTC signaling mode: $signalingMode"
+            }
+            options["mdm-webrtc-signaling-mode"] = signalingMode
+        }
+        if (extras.containsKey(EXTRA_WEBRTC_ENABLED) &&
+            !extras.getBoolean(EXTRA_WEBRTC_ENABLED, false)
+        ) {
+            options["mdm-webrtc-transport"] = "disabled"
+        }
+        return options
+    }
+
+    private fun copyBooleanOption(
+        extras: Bundle,
+        options: LinkedHashMap<String, String>,
+        extraKey: String,
+        optionKey: String
+    ) {
+        if (extras.containsKey(extraKey)) {
+            options[optionKey] = boolOption(extras.getBoolean(extraKey, false))
+        }
+    }
+
+    private fun normalizeIceServers(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) {
+            return ""
+        }
+        val input = if (trimmed.startsWith("[")) {
+            JSONArray(trimmed)
+        } else {
+            JSONArray().apply {
+                trimmed.split(',', '\n')
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .forEach { put(it) }
+            }
+        }
+        require(input.length() <= MAX_WEBRTC_ICE_SERVERS) { "too many WebRTC ICE servers" }
+
+        val output = JSONArray()
+        for (index in 0 until input.length()) {
+            when (val entry = input.get(index)) {
+                is String -> output.put(validateIceUrl(entry))
+                is JSONObject -> {
+                    val urls = normalizeIceServerUrls(entry.get("urls"))
+                    val username = entry.optString("username", "")
+                    val credential = entry.optString("credential", "")
+                    val credentialType = entry.optString("credential_type", "password")
+                        .trim()
+                        .lowercase()
+                    require(credentialType == "password") {
+                        "unsupported WebRTC ICE credential type"
+                    }
+                    require(username.length <= MAX_WEBRTC_ICE_CREDENTIAL_LENGTH) {
+                        "WebRTC ICE username is too long"
+                    }
+                    require(credential.length <= MAX_WEBRTC_ICE_CREDENTIAL_LENGTH) {
+                        "WebRTC ICE credential is too long"
+                    }
+                    output.put(JSONObject().apply {
+                        put("urls", urls)
+                        if (username.isNotEmpty()) put("username", username)
+                        if (credential.isNotEmpty()) put("credential", credential)
+                        put("credential_type", "password")
+                    })
+                }
+                else -> throw IllegalArgumentException("invalid WebRTC ICE server entry")
+            }
+        }
+        return output.toString()
+    }
+
+    private fun normalizeIceServerUrls(value: Any): Any {
+        return when (value) {
+            is String -> validateIceUrl(value)
+            is JSONArray -> JSONArray().apply {
+                require(value.length() in 1..MAX_WEBRTC_URLS_PER_SERVER) {
+                    "invalid WebRTC ICE URL count"
+                }
+                for (index in 0 until value.length()) {
+                    put(validateIceUrl(value.getString(index)))
+                }
+            }
+            else -> throw IllegalArgumentException("invalid WebRTC ICE urls")
+        }
+    }
+
+    private fun validateIceUrl(raw: String): String {
+        val value = raw.trim()
+        require(value.length <= MAX_WEBRTC_ICE_SERVER_LENGTH) {
+            "WebRTC ICE server URL is too long"
+        }
+        require(WEBRTC_ICE_SERVER_PATTERN.matches(value)) {
+            "invalid WebRTC ICE server URL"
+        }
+        return value
+    }
+
+    private fun firstPresentKey(extras: Bundle, vararg keys: String): String? {
+        return keys.firstOrNull { extras.containsKey(it) }
     }
 
     private fun managedStreamOptions(extras: Bundle?): LinkedHashMap<String, String> {
@@ -405,6 +642,7 @@ class MdmControlProvider : ContentProvider() {
                 putInt(KEY_STATUS_CAPTURE_SCALE, SCREEN_INFO.scale)
                 putInt(KEY_STATUS_CAPTURE_DPI, SCREEN_INFO.dpi)
                 putString(KEY_STATUS_CAPTURE_SOURCE, MainService.captureSource)
+                putString(KEY_STATUS_WEBRTC_CAPABILITIES, webRtcCapabilities(configDir()))
                 MainService.captureLastErrorMessage?.let {
                     putString(KEY_STATUS_CAPTURE_LAST_ERROR, it)
                 }
@@ -458,6 +696,15 @@ class MdmControlProvider : ContentProvider() {
         val ctx = context ?: return false
         return ctx.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
             .getBoolean(KEY_MDM_AUDIO_ENABLED, false)
+    }
+
+    private fun webRtcCapabilities(appDir: File): String {
+        return runCatching {
+            FFI.getWebRtcCapabilities(appDir.absolutePath)
+        }.getOrElse {
+            Log.w(TAG, "WebRTC capability query failed: ${it.message}")
+            "{\"data_channel_compiled\":false,\"media_track_compiled\":false,\"fallback_transport\":\"rustdesk-websocket-hbbs-hbbr\"}"
+        }
     }
 
     private fun readToml(file: File): List<String> {
@@ -601,11 +848,35 @@ class MdmControlProvider : ContentProvider() {
         private const val EXTRA_CUSTOM_IMAGE_QUALITY = "custom_image_quality"
         private const val EXTRA_CODEC_PREFERENCE = "codec_preference"
         private const val EXTRA_AUDIO_ENABLED = "audio_enabled"
+        private const val EXTRA_START_SERVER = "start_server"
         private const val EXTRA_FILE_TRANSFER_ENABLED = "file_transfer_enabled"
         private const val EXTRA_TCP_TUNNEL_ENABLED = "tcp_tunnel_enabled"
         private const val EXTRA_CONNECTION_STRATEGY = "connection_strategy"
         private const val EXTRA_TRANSPORT = "transport"
         private const val EXTRA_MTU = "mtu"
+        private const val EXTRA_WEBRTC_ICE_SERVERS = "webrtc_ice_servers"
+        private const val EXTRA_ICE_SERVERS_JSON = "ice_servers_json"
+        private const val EXTRA_ICE_SERVERS = "ice_servers"
+        private const val EXTRA_WEBRTC_TRANSPORT = "webrtc_transport_preference"
+        private const val EXTRA_TRANSPORT_PREFERENCE = "transport_preference"
+        private const val EXTRA_SESSION_TRANSPORT = "session_transport"
+        private const val EXTRA_WEBRTC_ICE_TRANSPORT = "webrtc_ice_transport_policy"
+        private const val EXTRA_ICE_TRANSPORT_POLICY = "ice_transport_policy"
+        private const val EXTRA_WEBRTC_ALLOW_DEFAULT_STUN = "webrtc_allow_default_stun"
+        private const val EXTRA_WEBRTC_MEDIA_ENABLED = "webrtc_media_enabled"
+        private const val EXTRA_WEBRTC_ENABLED = "webrtc_enabled"
+        private const val EXTRA_WEBRTC_BACKEND_SIGNALING_ENABLED =
+            "webrtc_backend_signaling_enabled"
+        private const val EXTRA_WEBRTC_DATA_CHANNEL_ENABLED = "webrtc_data_channel_enabled"
+        private const val EXTRA_WEBRTC_MEDIA_TRACK_ENABLED = "webrtc_media_track_enabled"
+        private const val EXTRA_WEBRTC_TURN_ENABLED = "webrtc_turn_enabled"
+        private const val EXTRA_WEBRTC_AUTOMATIC_FALLBACK_ENABLED =
+            "webrtc_automatic_fallback_enabled"
+        private const val EXTRA_WEBRTC_SELF_HEALING_ENABLED = "webrtc_self_healing_enabled"
+        private const val EXTRA_WEBRTC_SIGNALING_MODE = "webrtc_signaling_mode"
+        private const val EXTRA_WEBRTC_OFFER_ENDPOINT = "webrtc_offer_endpoint"
+        private const val METHOD_ACCEPT_WEBRTC_OFFER = "accept_webrtc_offer"
+        private const val KEY_WEBRTC_ANSWER_ENDPOINT = "webrtc_answer_endpoint"
 
         private const val KEY_SUCCESS = "success"
         private const val KEY_ERROR = "error"
@@ -633,9 +904,16 @@ class MdmControlProvider : ContentProvider() {
         private const val KEY_STATUS_CAPTURE_DPI = "capture_dpi"
         private const val KEY_STATUS_CAPTURE_SOURCE = "capture_source"
         private const val KEY_STATUS_CAPTURE_LAST_ERROR = "capture_last_error"
+        private const val KEY_STATUS_WEBRTC_CAPABILITIES = "webrtc_capabilities"
         private const val KEY_FORCE_CAPTURE_RESTART = "force_capture_restart"
         private const val KEY_RUSTDESK_ID = "rustdesk_id"
         private const val CAPTURE_SOURCE_MDM_SCREENRECORD = "mdm_screenrecord"
+        private const val MAX_WEBRTC_ICE_SERVERS = 8
+        private const val MAX_WEBRTC_URLS_PER_SERVER = 4
+        private const val MAX_WEBRTC_ICE_SERVER_LENGTH = 512
+        private const val MAX_WEBRTC_ICE_CREDENTIAL_LENGTH = 1024
+        private val WEBRTC_ICE_SERVER_PATTERN =
+            Regex("^(stun|stuns|turn|turns):(?:/{0,2})[^\\s,]+$", RegexOption.IGNORE_CASE)
 
         // mdm-agent 拉起 service 的 action (无 mediaProjection, 用于纯后台驻留)
         // 与 ACT_INIT_MEDIA_PROJECTION_AND_SERVICE 区别: 不弹投屏确认, 不需要 mediaProjection intent

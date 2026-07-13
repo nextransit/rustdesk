@@ -3039,8 +3039,7 @@ pub fn main_set_common(_key: String, _value: String) {
 
 pub fn session_set_common(session_id: SessionID, key: String, value: String) {
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
-        if key == "continue-insecure-connection"
-        {
+        if key == "continue-insecure-connection" {
             s.continue_insecure_connection(value == "Y");
             return;
         }
@@ -3081,11 +3080,55 @@ pub mod server_side {
         sys::{jboolean, jstring},
         JNIEnv,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            OnceLock,
+        },
+        time::Duration,
+    };
 
     use crate::start_server;
 
     static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(feature = "mdm-webrtc-datachannel")]
+    static MDM_WEBRTC_RUNTIME: OnceLock<hbb_common::tokio::runtime::Handle> = OnceLock::new();
+
+    #[cfg(feature = "mdm-webrtc-datachannel")]
+    pub(crate) fn register_mdm_webrtc_runtime() {
+        let Ok(handle) = hbb_common::tokio::runtime::Handle::try_current() else {
+            log::error!("MDM WebRTC runtime registration failed: no active Tokio runtime");
+            return;
+        };
+        if MDM_WEBRTC_RUNTIME.set(handle).is_err() {
+            log::debug!("MDM WebRTC runtime already registered");
+        }
+    }
+
+    fn configured_ice_server_count(value: &str) -> usize {
+        if let Ok(serde_json::Value::Array(entries)) =
+            serde_json::from_str::<serde_json::Value>(value)
+        {
+            return entries
+                .iter()
+                .map(|entry| match entry {
+                    serde_json::Value::String(_) => 1,
+                    serde_json::Value::Object(server) => match server.get("urls") {
+                        Some(serde_json::Value::Array(urls)) => urls.len(),
+                        Some(serde_json::Value::String(_)) => 1,
+                        _ => 0,
+                    },
+                    _ => 0,
+                })
+                .sum();
+        }
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .count()
+    }
 
     #[no_mangle]
     pub unsafe extern "system" fn Java_ffi_FFI_startServer(
@@ -3154,6 +3197,182 @@ pub mod server_side {
     }
 
     #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_getWebRtcCapabilities(
+        env: JNIEnv,
+        _class: JClass,
+        app_dir: JString,
+    ) -> jstring {
+        let mut env = env;
+        if let Ok(app_dir) = env.get_string(&app_dir) {
+            let app_dir: String = app_dir.into();
+            if !app_dir.is_empty() {
+                *config::APP_DIR.write().unwrap() = app_dir;
+            }
+        }
+        let ice_servers = config::Config::get_option(config::keys::OPTION_ICE_SERVERS);
+        let configured_ice_servers = configured_ice_server_count(&ice_servers);
+        let transport_preference =
+            config::Config::get_option(config::keys::OPTION_MDM_WEBRTC_TRANSPORT);
+        let media_runtime_armed =
+            config::Config::get_bool_option(config::keys::OPTION_MDM_WEBRTC_MEDIA_ENABLED);
+        let webrtc_enabled =
+            config::Config::get_bool_option(config::keys::OPTION_MDM_WEBRTC_ENABLED);
+        let data_channel_enabled =
+            config::Config::get_bool_option(config::keys::OPTION_MDM_WEBRTC_DATA_CHANNEL_ENABLED);
+        let backend_signaling_enabled = config::Config::get_bool_option(
+            config::keys::OPTION_MDM_WEBRTC_BACKEND_SIGNALING_ENABLED,
+        );
+        let fallback_enabled =
+            config::Config::get_bool_option(config::keys::OPTION_MDM_WEBRTC_FALLBACK_ENABLED);
+        let turn_enabled =
+            config::Config::get_bool_option(config::keys::OPTION_MDM_WEBRTC_TURN_ENABLED);
+        let self_healing_enabled =
+            config::Config::get_bool_option(config::keys::OPTION_MDM_WEBRTC_SELF_HEALING_ENABLED);
+        let data_channel_compiled = cfg!(feature = "mdm-webrtc-datachannel");
+        let media_track_compiled = cfg!(feature = "mdm-webrtc-media");
+        let capability_state = if !webrtc_enabled {
+            "legacy-disabled-by-policy"
+        } else if !data_channel_compiled {
+            "legacy-datachannel-not-compiled"
+        } else if !data_channel_enabled {
+            "legacy-datachannel-disabled-by-policy"
+        } else {
+            "datachannel-ready"
+        };
+        let media_track_state = if !media_track_compiled {
+            "not-compiled"
+        } else {
+            "encoded-adapter-seam-ready"
+        };
+        let capabilities = serde_json::json!({
+            "data_channel_compiled": data_channel_compiled,
+            "data_channel_enabled": data_channel_enabled,
+            "webrtc_enabled": webrtc_enabled,
+            "capability_state": capability_state,
+            "backend_signaling_enabled": backend_signaling_enabled,
+            "media_track_compiled": media_track_compiled,
+            "media_track_state": media_track_state,
+            "media_runtime_requested": media_runtime_armed,
+            "media_track_active": false,
+            "media_adapter": if media_track_compiled {
+                "encoded-h264-annex-b-opus"
+            } else {
+                "unavailable"
+            },
+            "video_codecs": if media_track_compiled {
+                vec!["H264"]
+            } else {
+                Vec::<&str>::new()
+            },
+            "audio_codecs": if media_track_compiled {
+                vec!["Opus"]
+            } else {
+                Vec::<&str>::new()
+            },
+            "transport_preference": transport_preference,
+            "ice_transport_policy": config::Config::get_option(
+                config::keys::OPTION_MDM_WEBRTC_ICE_TRANSPORT,
+            ),
+            "configured_ice_server_count": configured_ice_servers,
+            "turn_enabled": turn_enabled,
+            "signaling_mode": config::Config::get_option(
+                config::keys::OPTION_MDM_WEBRTC_SIGNALING_MODE,
+            ),
+            "signaling_path": if backend_signaling_enabled {
+                "backend-session"
+            } else {
+                "existing-rustdesk-session"
+            },
+            "requires_browser_mqtt_signaling": false,
+            "automatic_fallback_enabled": fallback_enabled,
+            "self_healing_enabled": self_healing_enabled,
+            "runtime_transport_state": "not-observed",
+            "legacy_fallback_preserved": true,
+            "fallback_transport": "rustdesk-websocket-hbbs-hbbr",
+        });
+        env.new_string(capabilities.to_string())
+            .unwrap_or_default()
+            .into_raw()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_acceptWebRtcOffer(
+        env: JNIEnv,
+        _class: JClass,
+        app_dir: JString,
+        offer_endpoint: JString,
+    ) -> jstring {
+        let mut env = env;
+        if let Ok(app_dir) = env.get_string(&app_dir) {
+            let app_dir: String = app_dir.into();
+            if !app_dir.is_empty() {
+                *config::APP_DIR.write().unwrap() = app_dir;
+            }
+        }
+        let offer_endpoint = match env.get_string(&offer_endpoint) {
+            Ok(value) => String::from(value),
+            Err(error) => {
+                return env
+                    .new_string(format!("invalid WebRTC offer: {error}"))
+                    .unwrap_or_default()
+                    .into_raw();
+            }
+        };
+        #[cfg(feature = "mdm-webrtc-datachannel")]
+        let result = if let Some(runtime) = MDM_WEBRTC_RUNTIME.get() {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            runtime.spawn(async move {
+                use hbb_common::webrtc::WebRTCStream;
+                use hbb_common::Stream;
+                use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+                let result = async move {
+                    let stream = WebRTCStream::new(&offer_endpoint, false, 15_000).await?;
+                    let answer_endpoint = stream.get_local_endpoint().await?;
+                    let server = crate::server::active_server().ok_or_else(|| {
+                        hbb_common::anyhow::anyhow!("RustDesk server is not ready")
+                    })?;
+                    let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                    hbb_common::tokio::spawn(async move {
+                        if let Err(error) = crate::server::create_tcp_connection(
+                            server,
+                            Stream::WebRTC(stream),
+                            peer_addr,
+                            true,
+                            crate::server::ConnectionMeta::default(),
+                        )
+                        .await
+                        {
+                            log::error!("MDM WebRTC connection failed: {error}");
+                        }
+                    });
+                    Ok::<String, hbb_common::anyhow::Error>(answer_endpoint)
+                }
+                .await;
+                if sender.send(result).is_err() {
+                    log::warn!("MDM WebRTC answer receiver disconnected");
+                }
+            });
+            match receiver.recv_timeout(Duration::from_secs(20)) {
+                Ok(result) => result,
+                Err(error) => Err(hbb_common::anyhow::anyhow!(
+                    "WebRTC answer timed out: {error}"
+                )),
+            }
+        } else {
+            Err(hbb_common::anyhow::anyhow!(
+                "RustDesk WebRTC runtime is not ready"
+            ))
+        };
+        #[cfg(not(feature = "mdm-webrtc-datachannel"))]
+        let result: Result<String, hbb_common::anyhow::Error> = Err(hbb_common::anyhow::anyhow!(
+            "WebRTC DataChannel is not compiled"
+        ));
+        let value = result.unwrap_or_else(|error| format!("WebRTC answer failed: {error}"));
+        env.new_string(value).unwrap_or_default().into_raw()
+    }
+
+    #[no_mangle]
     pub unsafe extern "system" fn Java_ffi_FFI_setOption(
         env: JNIEnv,
         _class: JClass,
@@ -3199,7 +3418,9 @@ pub mod server_side {
             "verification-method".to_owned(),
             "use-permanent-password".to_owned(),
         );
-        jboolean::from(super::main_set_permanent_password_with_result(password.into()))
+        jboolean::from(super::main_set_permanent_password_with_result(
+            password.into(),
+        ))
     }
 
     #[no_mangle]
@@ -3216,7 +3437,9 @@ pub mod server_side {
             }
         }
         config::Config::set_option("verification-method".to_owned(), "".to_owned());
-        jboolean::from(super::main_set_permanent_password_with_result("".to_owned()))
+        jboolean::from(super::main_set_permanent_password_with_result(
+            "".to_owned(),
+        ))
     }
 
     #[no_mangle]

@@ -74,13 +74,20 @@ class MainService : Service() {
         val mapped = mapRemoteInputToScreen(x, y)
         val mappedX = mapped.first
         val mappedY = mapped.second
-        val inputService = InputService.ctx
-        if (inputService != null) {
+        if (MdmInputFallback.isAvailable(applicationContext)) {
             Log.i(
                 logTag,
-                "MDM-InputDispatch pointer_route=accessibility kind=$kind mask=$mask " +
+                "MDM-InputDispatch pointer_route=system_input_manager kind=$kind mask=$mask " +
                     "raw_x=$x raw_y=$y x=$mappedX y=$mappedY"
             )
+            if (MdmInputFallback.pointer(applicationContext, kind, mask, mappedX, mappedY)) {
+                return
+            }
+            Log.w(logTag, "MDM-InputDispatch pointer_route=system_input_manager_failed kind=$kind mask=$mask")
+        }
+        val inputService = InputService.ctx
+        if (inputService != null) {
+            Log.i(logTag, "MDM-InputDispatch pointer_route=accessibility kind=$kind mask=$mask")
             when (kind) {
                 0 -> { // touch
                     inputService.onTouchInput(mask, mappedX, mappedY)
@@ -94,14 +101,7 @@ class MainService : Service() {
             }
             return
         }
-        Log.w(
-            logTag,
-            "MDM-InputDispatch pointer_route=provider_fallback reason=accessibility_unavailable kind=$kind mask=$mask " +
-                "raw_x=$x raw_y=$y x=$mappedX y=$mappedY"
-        )
-        if (!MdmInputFallback.pointer(applicationContext, kind, mask, mappedX, mappedY)) {
-            Log.w(logTag, "MDM-InputDispatch pointer_route=provider_fallback_failed kind=$kind mask=$mask")
-        }
+        Log.w(logTag, "MDM-InputDispatch pointer_route=unavailable kind=$kind mask=$mask")
     }
 
     private fun mapRemoteInputToScreen(x: Int, y: Int): Pair<Int, Int> {
@@ -113,19 +113,19 @@ class MainService : Service() {
     @Keep
     @RequiresApi(Build.VERSION_CODES.N)
     fun rustKeyEventInput(input: ByteArray) {
+        if (MdmInputFallback.isAvailable(applicationContext) &&
+            MdmInputFallback.key(applicationContext, input)
+        ) {
+            Log.i(logTag, "MDM-InputDispatch key_route=system_input_manager bytes=${input.size}")
+            return
+        }
         val inputService = InputService.ctx
         if (inputService != null) {
             Log.i(logTag, "MDM-InputDispatch key_route=accessibility bytes=${input.size}")
             inputService.onKeyEvent(input)
             return
         }
-        Log.w(
-            logTag,
-            "MDM-InputDispatch key_route=provider_fallback reason=accessibility_unavailable bytes=${input.size}"
-        )
-        if (!MdmInputFallback.key(applicationContext, input)) {
-            Log.w(logTag, "MDM-InputDispatch key_route=provider_fallback_failed bytes=${input.size}")
-        }
+        Log.w(logTag, "MDM-InputDispatch key_route=unavailable bytes=${input.size}")
     }
 
     @Keep
@@ -288,7 +288,7 @@ class MainService : Service() {
         private const val CAPTURE_STATS_LOG_INTERVAL_MS = 5_000L
         private const val MDM_MAX_PUBLISH_FPS = 15
         private const val MDM_MIN_PUBLISH_INTERVAL_MS = 1000L / MDM_MAX_PUBLISH_FPS
-        private const val MDM_KEEPALIVE_FRAME_INTERVAL_MS = 250L
+        private const val MDM_KEEPALIVE_FRAME_INTERVAL_MS = 1000L / MDM_MAX_PUBLISH_FPS
         private const val MDM_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024
         private const val CAPTURE_LOG_TAG = "LOG_SERVICE"
         private const val MEDIA_PROJECTION_REQUEST_TTL_MS = 12_000L

@@ -104,6 +104,19 @@ lazy_static::lazy_static! {
     // Now we use this [`CLIENT_SERVER`] to do following operations:
     // - record local audio, and send to remote
     pub static ref CLIENT_SERVER: ServerPtr = new();
+    static ref ACTIVE_SERVER: Mutex<Option<ServerPtrWeak>> = Mutex::new(None);
+}
+
+pub fn set_active_server(server: &ServerPtr) {
+    *ACTIVE_SERVER.lock().unwrap() = Some(Arc::downgrade(server));
+}
+
+pub fn active_server() -> Option<ServerPtr> {
+    ACTIVE_SERVER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(Weak::upgrade)
 }
 
 pub struct Server {
@@ -610,6 +623,8 @@ pub fn check_zombie() {
 #[cfg(any(target_os = "android", target_os = "ios"))]
 #[tokio::main]
 pub async fn start_server(_is_server: bool) {
+    #[cfg(all(target_os = "android", feature = "mdm-webrtc-datachannel"))]
+    crate::flutter_ffi::server_side::register_mdm_webrtc_runtime();
     crate::RendezvousMediator::start_all().await;
 }
 

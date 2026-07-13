@@ -4,7 +4,7 @@ import groovy.json.JsonSlurper
 plugins {
     id "com.google.protobuf" version "0.9.4"
     id "com.android.application"
-    id "kotlin-android"
+    id "org.jetbrains.kotlin.android"
     id "dev.flutter.flutter-gradle-plugin"
 }
 

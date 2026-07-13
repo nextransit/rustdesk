@@ -148,6 +148,7 @@ impl RendezvousMediator {
         }
         check_zombie();
         let server = new_server();
+        crate::server::set_active_server(&server);
         if config::option2bool("stop-service", &Config::get_option("stop-service")) {
             crate::test_rendezvous_server();
         }

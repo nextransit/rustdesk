@@ -29,6 +29,7 @@ use crate::{common::DEVICE_NAME, flutter::connection_manager::start_channel};
 use cidr_utils::cidr::IpCidr;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
+use hbb_common::protobuf::Message as ProtobufMessage;
 use hbb_common::{
     config::{
         self, decode_permanent_password_h1_from_storage, decode_preset_password_h1_from_storage,
@@ -138,6 +139,41 @@ lazy_static::lazy_static! {
 pub static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub static MOUSE_MOVE_TIME: AtomicI64 = AtomicI64::new(0);
+
+fn transport_message_kind(msg: &Message) -> &'static str {
+    match &msg.union {
+        Some(message::Union::VideoFrame(_)) => "video",
+        Some(message::Union::AudioFrame(_)) => "audio",
+        Some(message::Union::LoginResponse(_)) => "login_response",
+        Some(message::Union::PeerInfo(_)) => "peer_info",
+        Some(message::Union::TestDelay(_)) => "test_delay",
+        Some(message::Union::Misc(_)) => "misc",
+        Some(message::Union::CursorData(_))
+        | Some(message::Union::CursorPosition(_))
+        | Some(message::Union::CursorId(_)) => "cursor",
+        Some(message::Union::Clipboard(_))
+        | Some(message::Union::Cliprdr(_))
+        | Some(message::Union::MultiClipboards(_)) => "clipboard",
+        Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) => "file",
+        Some(_) => "control",
+        None => "empty",
+    }
+}
+
+fn log_transport_send_failure(conn_id: i32, msg: &Message, error: &dyn std::fmt::Display) {
+    let kind = transport_message_kind(msg);
+    let bytes = msg
+        .write_to_bytes()
+        .map(|encoded| encoded.len())
+        .unwrap_or_default();
+    let detail = format!(
+        "MDM-WebRTC send_failed conn_id={} kind={} protobuf_bytes={} error={}",
+        conn_id, kind, bytes, error
+    );
+    log::error!("{}", detail);
+    #[cfg(target_os = "android")]
+    android_log("rustdesk_transport", &detail);
+}
 
 #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1011,6 +1047,7 @@ impl Connection {
                         }
                     }
                     if let Err(err) = conn.stream.send(&value as &Message).await {
+                        log_transport_send_failure(id, &value, &err);
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
@@ -1061,6 +1098,7 @@ impl Connection {
                             #[cfg(not(target_os = "ios"))]
                             if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(&conn.lr.version, &conn.lr.my_platform, _multi_clipboards) {
                                 if let Err(err) = conn.stream.send(&msg_out).await {
+                                    log_transport_send_failure(id, &msg_out, &err);
                                     conn.on_close(&err.to_string(), false).await;
                                     break;
                                 }
@@ -1072,6 +1110,7 @@ impl Connection {
 
                     let msg: &Message = &msg;
                     if let Err(err) = conn.stream.send(msg).await {
+                        log_transport_send_failure(id, msg, &err);
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
@@ -5181,7 +5220,9 @@ impl Connection {
 
     #[inline]
     async fn send(&mut self, msg: Message) {
-        allow_err!(self.stream.send(&msg).await);
+        if let Err(err) = self.stream.send(&msg).await {
+            log_transport_send_failure(self.inner.id(), &msg, &err);
+        }
     }
 
     pub fn alive_conns() -> Vec<i32> {
