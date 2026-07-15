@@ -196,6 +196,8 @@ class MainService : Service() {
                             if (requiresMdmSystemScreenrecord()) {
                                 if (!switchToMdmSystemScreenrecordCapture("add_connection", false)) {
                                     Log.w(logTag, "add_connection: managed screenrecord source is not ready")
+                                } else {
+                                    republishMdmFrameForNewConnection("add_connection")
                                 }
                             } else if (mediaProjection == null) {
                                 Log.d(logTag, "add_connection: mediaProjection null, requesting")
@@ -316,6 +318,10 @@ class MainService : Service() {
         private const val MDM_DISPLAY_REFRESH_SETTLE_MS = 250L
         private const val MDM_BOOTSTRAP_MAX_BYTES = 2 * 1024 * 1024
         private const val MDM_BOOTSTRAP_TRAILING_NAL_STABLE_MS = 200L
+        private const val MDM_BOOTSTRAP_DRAIN_ATTEMPTS = 20
+        private const val MDM_BOOTSTRAP_NO_FRAME_RECOVERY_MS = 8_000L
+        private const val MDM_DECODE_STALL_RECOVERY_MS = 4_000L
+        private const val MDM_DECODE_STALL_MIN_INPUT_DELTA = 4L
         private const val CAPTURE_LOG_TAG = "LOG_SERVICE"
         private const val MEDIA_PROJECTION_REQUEST_TTL_MS = 12_000L
         private const val CAPTURE_SOURCE_NONE = "none"
@@ -581,6 +587,7 @@ class MainService : Service() {
     @Volatile private var mdmLastRgbaFrame: ByteBuffer? = null
     @Volatile private var mdmLastFrameOutputAtMs = 0L
     @Volatile private var mdmLastDecodedFramePublishedAtMs = 0L
+    @Volatile private var mdmDecoderInputCountAtLastOutput = 0L
     @Volatile private var mdmBootstrapInProgress = false
     private var mdmPendingBootstrapFrame: ByteBuffer? = null
     private var mdmKeepaliveFrameCount = 0L
@@ -1498,6 +1505,7 @@ class MainService : Service() {
             mdmLastRgbaFrame = null
             mdmLastFrameOutputAtMs = 0L
             mdmLastDecodedFramePublishedAtMs = 0L
+            mdmDecoderInputCountAtLastOutput = 0L
             mdmBootstrapInProgress = false
             mdmPendingBootstrapFrame = null
             mdmKeepaliveFrameCount = 0L
@@ -1843,7 +1851,8 @@ class MainService : Service() {
                         )
                         mdmBootstrapInProgress = true
                         mdmPendingBootstrapFrame = null
-                        for (accessUnit in groupMdmAvcAccessUnits(bootstrap.nalUnits)) {
+                        val bootstrapAccessUnits = groupMdmAvcAccessUnits(bootstrap.nalUnits)
+                        for (accessUnit in bootstrapAccessUnits) {
                             while (isStart && mdmDecoder === decoder) {
                                 drainMdmDecoderOutput(decoder, Long.MAX_VALUE)
                                 if (queueMdmDecoderInput(decoder, accessUnit, presentationTimeUs)) {
@@ -1857,6 +1866,38 @@ class MainService : Service() {
                         repeat(10) {
                             drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
                             Thread.sleep(5L)
+                        }
+                        // MTK Android 9 decoders frequently retain a lone bootstrap IDR
+                        // until the next access unit arrives. A static screen may not
+                        // produce that next unit for tens of seconds, leaving the browser
+                        // with audio but no first video frame. Re-queue the last complete
+                        // access unit once as a decoder flush; all bootstrap outputs remain
+                        // suppressed and only the latest decoded frame is published below.
+                        if (mdmPendingBootstrapFrame == null && bootstrapAccessUnits.isNotEmpty()) {
+                            val flushAccessUnit = bootstrapAccessUnits.last()
+                            while (isStart && mdmDecoder === decoder) {
+                                drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
+                                if (queueMdmDecoderInput(decoder, flushAccessUnit, presentationTimeUs)) {
+                                    suppressOutputThroughUs = presentationTimeUs
+                                    presentationTimeUs += 33_333L
+                                    Log.i(
+                                        logTag,
+                                        "mdm bootstrap queued duplicate access unit to flush decoder " +
+                                            "reason=$openReason bytes=${flushAccessUnit.size}"
+                                    )
+                                    break
+                                }
+                                Thread.sleep(5L)
+                            }
+                            var drainAttempt = 0
+                            while (
+                                mdmPendingBootstrapFrame == null &&
+                                drainAttempt < MDM_BOOTSTRAP_DRAIN_ATTEMPTS
+                            ) {
+                                drainMdmDecoderOutput(decoder, suppressOutputThroughUs)
+                                drainAttempt += 1
+                                Thread.sleep(5L)
+                            }
                         }
                         publishMdmBootstrapFrame(openReason, bootstrap.nalUnits.size)
                         mdmBootstrapInProgress = false
@@ -1915,8 +1956,63 @@ class MainService : Service() {
 
     private fun startMdmKeepaliveThread(decoder: MediaCodec) {
         val keepaliveThread = Thread({
+            val startedAtMs = System.currentTimeMillis()
+            var recoveryScheduled = false
             while (isStart && mdmDecoder === decoder) {
                 emitMdmKeepaliveFrameIfNeeded()
+                if (
+                    !recoveryScheduled &&
+                    mdmLastRgbaFrame == null &&
+                    System.currentTimeMillis() - startedAtMs >= MDM_BOOTSTRAP_NO_FRAME_RECOVERY_MS
+                ) {
+                    recoveryScheduled = true
+                    Log.w(
+                        logTag,
+                        "mdm screenrecord produced no first frame after " +
+                            "${MDM_BOOTSTRAP_NO_FRAME_RECOVERY_MS}ms; restarting decoder"
+                    )
+                    Thread({
+                        if (isStart && mdmDecoder === decoder && mdmLastRgbaFrame == null) {
+                            switchToMdmSystemScreenrecordCapture(
+                                "bootstrap_no_first_frame",
+                                forceRestart = true
+                            )
+                        }
+                    }, "mdm-screenrecord-first-frame-recovery").start()
+                    return@Thread
+                }
+                val decodedFrameAgeMs = System.currentTimeMillis() - mdmLastDecodedFramePublishedAtMs
+                val decoderInputDelta = mdmDecoderInputCount.get() - mdmDecoderInputCountAtLastOutput
+                if (
+                    !recoveryScheduled &&
+                    mdmLastRgbaFrame != null &&
+                    mdmLastDecodedFramePublishedAtMs > 0L &&
+                    decodedFrameAgeMs >= MDM_DECODE_STALL_RECOVERY_MS &&
+                    decoderInputDelta >= MDM_DECODE_STALL_MIN_INPUT_DELTA
+                ) {
+                    recoveryScheduled = true
+                    Log.w(
+                        logTag,
+                        "mdm decoder stalled with active input; restarting capture " +
+                            "frame_age_ms=$decodedFrameAgeMs input_delta=$decoderInputDelta " +
+                            "decoder_in=${mdmDecoderInputCount.get()} " +
+                            "decoder_out=${mdmDecoderOutputCount.get()}"
+                    )
+                    Thread({
+                        if (
+                            isStart &&
+                            mdmDecoder === decoder &&
+                            System.currentTimeMillis() - mdmLastDecodedFramePublishedAtMs >=
+                                MDM_DECODE_STALL_RECOVERY_MS
+                        ) {
+                            switchToMdmSystemScreenrecordCapture(
+                                "decoder_output_stall",
+                                forceRestart = true
+                            )
+                        }
+                    }, "mdm-screenrecord-decoder-stall-recovery").start()
+                    return@Thread
+                }
                 Thread.sleep(5L)
             }
         }, "mdm-screenrecord-keepalive")
@@ -1932,34 +2028,76 @@ class MainService : Service() {
         if (currentLength <= 0L) {
             return MdmFeedBootstrap(emptyList(), ByteArray(0), 0L)
         }
-        val readLength = min(currentLength, MDM_BOOTSTRAP_MAX_BYTES.toLong()).toInt()
-        val startOffset = currentLength - readLength
-        val bytes = ByteArray(readLength)
-        stream.seek(startOffset)
-        stream.readFully(bytes)
-        val parseBytes = if (allowStableTrailingNal) {
-            bytes + byteArrayOf(0, 0, 0, 1)
+        val tailReadLength = min(currentLength, MDM_BOOTSTRAP_MAX_BYTES.toLong()).toInt()
+        val tailStartOffset = currentLength - tailReadLength
+        val tailBytes = ByteArray(tailReadLength)
+        stream.seek(tailStartOffset)
+        stream.readFully(tailBytes)
+        val tailParseBytes = if (allowStableTrailingNal) {
+            tailBytes + byteArrayOf(0, 0, 0, 1)
         } else {
-            bytes
+            tailBytes
         }
-        val parsed = extractCompleteAnnexBNalUnits(parseBytes)
-        val nalUnits = parsed.first
-        val idrIndex = nalUnits.indexOfLast { mdmH264NalType(it) == 5 }
+        val tailParsed = extractCompleteAnnexBNalUnits(tailParseBytes)
+        val tailNalUnits = tailParsed.first
+        val idrIndex = tailNalUnits.indexOfLast { mdmH264NalType(it) == 5 }
         if (idrIndex < 0) {
-            return MdmFeedBootstrap(emptyList(), bytes, currentLength)
+            return MdmFeedBootstrap(emptyList(), tailBytes, currentLength)
         }
-        val spsIndex = (idrIndex downTo 0).firstOrNull { mdmH264NalType(nalUnits[it]) == 7 }
-        val ppsIndex = (idrIndex downTo 0).firstOrNull { mdmH264NalType(nalUnits[it]) == 8 }
-        if (spsIndex == null || ppsIndex == null) {
-            return MdmFeedBootstrap(emptyList(), bytes, currentLength)
+
+        val tailSps = (idrIndex downTo 0)
+            .firstOrNull { mdmH264NalType(tailNalUnits[it]) == 7 }
+            ?.let { tailNalUnits[it] }
+        val tailPps = (idrIndex downTo 0)
+            .firstOrNull { mdmH264NalType(tailNalUnits[it]) == 8 }
+            ?.let { tailNalUnits[it] }
+
+        // screenrecord emits SPS/PPS at the beginning of the generation, while a
+        // long-running file can place the newest IDR beyond the tail bootstrap
+        // window. Read the head independently and combine its parameter sets with
+        // the newest complete IDR from the tail. Prefer tail parameter sets when a
+        // mid-stream format refresh happened.
+        var parameterSetSource = "tail"
+        var sps = tailSps
+        var pps = tailPps
+        if (sps == null || pps == null) {
+            val headReadLength = min(currentLength, MDM_BOOTSTRAP_MAX_BYTES.toLong()).toInt()
+            val headBytes = if (tailStartOffset == 0L) {
+                tailBytes
+            } else {
+                ByteArray(headReadLength).also {
+                    stream.seek(0L)
+                    stream.readFully(it)
+                }
+            }
+            val headNalUnits = extractCompleteAnnexBNalUnits(
+                headBytes + byteArrayOf(0, 0, 0, 1)
+            ).first
+            if (sps == null) {
+                sps = headNalUnits.lastOrNull { mdmH264NalType(it) == 7 }
+            }
+            if (pps == null) {
+                pps = headNalUnits.lastOrNull { mdmH264NalType(it) == 8 }
+            }
+            parameterSetSource = "head"
         }
+        if (sps == null || pps == null) {
+            return MdmFeedBootstrap(emptyList(), tailBytes, currentLength)
+        }
+        val selectedSps = sps ?: return MdmFeedBootstrap(emptyList(), tailBytes, currentLength)
+        val selectedPps = pps ?: return MdmFeedBootstrap(emptyList(), tailBytes, currentLength)
         val selected = ArrayList<ByteArray>()
-        selected.add(nalUnits[spsIndex])
-        selected.add(nalUnits[ppsIndex])
-        selected.addAll(nalUnits.subList(idrIndex, nalUnits.size))
+        selected.add(selectedSps)
+        selected.add(selectedPps)
+        selected.addAll(tailNalUnits.subList(idrIndex, tailNalUnits.size))
+        Log.i(
+            logTag,
+            "mdm h264 bootstrap assembled parameter_sets=$parameterSetSource " +
+                "tail_start=$tailStartOffset size=$currentLength idr_index=$idrIndex"
+        )
         return MdmFeedBootstrap(
             selected,
-            if (allowStableTrailingNal) ByteArray(0) else parsed.second,
+            if (allowStableTrailingNal) ByteArray(0) else tailParsed.second,
             currentLength
         )
     }
@@ -2047,6 +2185,7 @@ class MainService : Service() {
                             mdmRgbaConversionNanos.addAndGet(System.nanoTime() - conversionStartedAtNs)
                             if (rgbaBuffer != null) {
                                 mdmDecoderOutputCount.incrementAndGet()
+                                mdmDecoderInputCountAtLastOutput = mdmDecoderInputCount.get()
                                 rgbaBuffer.rewind()
                                 val byteCount = rgbaBuffer.remaining()
                                 val frame = copyMdmRgbaFrame(rgbaBuffer, suppressCurrentOutput)
@@ -2095,8 +2234,31 @@ class MainService : Service() {
         val now = System.currentTimeMillis()
         mdmLastFrameOutputAtMs = now
         mdmLastDecodedFramePublishedAtMs = now
+        mdmDecoderInputCountAtLastOutput = mdmDecoderInputCount.get()
         recordCaptureFrame(byteCount)
         Log.i(logTag, "mdm bootstrap published latest frame only reason=$reason nals=$bootstrapNalCount")
+    }
+
+    private fun republishMdmFrameForNewConnection(reason: String) {
+        val frame = mdmLastRgbaFrame?.duplicate()?.apply { rewind() }
+        if (frame == null) {
+            // The bootstrap path will publish the first frame shortly. Refresh is
+            // still required here so Rust keeps the request pending for the new
+            // subscriber instead of relying on a refresh emitted before it existed.
+            FFI.refreshScreen()
+            Log.w(logTag, "MDM-ConnectionFrameRefresh pending_bootstrap reason=$reason")
+            return
+        }
+        val submitStartedAtNs = System.nanoTime()
+        FFI.onVideoFrameUpdate(frame)
+        mdmJniSubmitNanos.addAndGet(System.nanoTime() - submitStartedAtNs)
+        mdmLastFrameOutputAtMs = System.currentTimeMillis()
+        captureDuplicateFrameCount.incrementAndGet()
+        FFI.refreshScreen()
+        Log.i(
+            logTag,
+            "MDM-ConnectionFrameRefresh republished=true reason=$reason bytes=${frame.remaining()}"
+        )
     }
 
     private fun copyMdmRgbaFrame(source: ByteBuffer, pending: Boolean): ByteBuffer {
@@ -2327,6 +2489,7 @@ class MainService : Service() {
         mdmLastRgbaFrame = null
         mdmLastFrameOutputAtMs = 0L
         mdmLastDecodedFramePublishedAtMs = 0L
+        mdmDecoderInputCountAtLastOutput = 0L
         mdmBootstrapInProgress = false
         mdmPendingBootstrapFrame = null
         mdmKeepaliveFrameCount = 0L

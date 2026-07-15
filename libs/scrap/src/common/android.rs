@@ -12,9 +12,11 @@ lazy_static! {
 
 pub struct Capturer {
     display: Display,
+    capture_width: usize,
+    capture_height: usize,
     rgba: Vec<u8>,
     saved_raw_data: Vec<u8>, // for faster compare and copy
-    rgba_scaled: Vec<u8>, // downscaled buffer
+    rgba_scaled: Vec<u8>,    // downscaled buffer
 }
 
 fn get_scale() -> f64 {
@@ -31,7 +33,41 @@ fn get_scale() -> f64 {
         .max(1.0)
 }
 
-fn downscale_rgba(src: &[u8], src_w: usize, src_h: usize, dst: &mut Vec<u8>, dst_w: usize, dst_h: usize) {
+fn is_managed_screenrecord() -> bool {
+    call_main_service_get_by_name("capture_source")
+        .map(|source| source == "mdm_screenrecord")
+        .unwrap_or(false)
+}
+
+fn get_capture_size() -> Option<(usize, usize)> {
+    let value = call_main_service_get_by_name("capture_size").ok()?;
+    let json = serde_json::from_str::<HashMap<String, Value>>(&value).ok()?;
+    let width = json.get("width")?.as_u64()? as usize;
+    let height = json.get("height")?.as_u64()? as usize;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+pub fn expected_capture_size(display: &Display) -> (usize, usize) {
+    if is_managed_screenrecord() {
+        return get_capture_size().unwrap_or((display.width(), display.height()));
+    }
+    let scale = get_scale();
+    if scale <= 1.001 {
+        return (display.width(), display.height());
+    }
+    let width = (((display.width() as f64 / scale) as usize) / 2 * 2).max(16);
+    let height = (((display.height() as f64 / scale) as usize) / 2 * 2).max(16);
+    (width, height)
+}
+
+fn downscale_rgba(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut Vec<u8>,
+    dst_w: usize,
+    dst_h: usize,
+) {
     dst.resize(dst_w * dst_h * 4, 0);
     for dy in 0..dst_h {
         let sy = (dy * src_h) / dst_h;
@@ -49,8 +85,11 @@ fn downscale_rgba(src: &[u8], src_w: usize, src_h: usize, dst: &mut Vec<u8>, dst
 
 impl Capturer {
     pub fn new(display: Display) -> io::Result<Capturer> {
+        let (capture_width, capture_height) = expected_capture_size(&display);
         Ok(Capturer {
             display,
+            capture_width,
+            capture_height,
             rgba: Vec::new(),
             saved_raw_data: Vec::new(),
             rgba_scaled: Vec::new(),
@@ -58,74 +97,62 @@ impl Capturer {
     }
 
     pub fn width(&self) -> usize {
-        let scale = get_scale();
-        if scale > 1.001 {
-            let mut w = (self.display.width() as f64 / scale) as usize;
-            w = (w / 2) * 2;
-            w.max(16)
-        } else {
-            self.display.width() as usize
-        }
+        self.capture_width
     }
 
     pub fn height(&self) -> usize {
-        let scale = get_scale();
-        if scale > 1.001 {
-            let mut h = (self.display.height() as f64 / scale) as usize;
-            h = (h / 2) * 2;
-            h.max(16)
-        } else {
-            self.display.height() as usize
-        }
+        self.capture_height
     }
 }
 
 impl crate::TraitCapturer for Capturer {
     fn frame<'a>(&'a mut self, _timeout: Duration) -> io::Result<Frame<'a>> {
         if get_video_raw(&mut self.rgba, &mut self.saved_raw_data).is_some() {
-            if let Some((width, height, _)) = get_size() {
-                let expected_len = width as usize * height as usize * 4;
-                if self.rgba.len() == expected_len
-                    && (self.display.rect.w != width || self.display.rect.h != height)
-                {
-                    self.display.rect.w = width;
-                    self.display.rect.h = height;
-                    let mut screen_size = SCREEN_SIZE.lock().unwrap();
-                    let scale = screen_size.2;
-                    *screen_size = (width, height, scale);
-                    log::info!(
-                        "android capturer synchronized raw frame size to {}x{} bytes={}",
-                        width,
-                        height,
-                        self.rgba.len()
-                    );
+            if is_managed_screenrecord() {
+                if let Some((width, height)) = get_capture_size() {
+                    let expected_len = width * height * 4;
+                    if self.rgba.len() == expected_len
+                        && (self.capture_width != width || self.capture_height != height)
+                    {
+                        self.capture_width = width;
+                        self.capture_height = height;
+                        log::info!(
+                            "android capturer synchronized capture frame size to {}x{} bytes={}",
+                            width,
+                            height,
+                            self.rgba.len()
+                        );
+                    }
                 }
             }
             let scale = get_scale();
             if scale > 1.001 {
                 let orig_w = self.display.width() as usize;
                 let orig_h = self.display.height() as usize;
-                let dst_w = self.width();
-                let dst_h = self.height();
+                let dst_w = self.capture_width;
+                let dst_h = self.capture_height;
                 if self.rgba.len() >= orig_w * orig_h * 4 {
-                    downscale_rgba(&self.rgba, orig_w, orig_h, &mut self.rgba_scaled, dst_w, dst_h);
+                    downscale_rgba(
+                        &self.rgba,
+                        orig_w,
+                        orig_h,
+                        &mut self.rgba_scaled,
+                        dst_w,
+                        dst_h,
+                    );
                     Ok(Frame::PixelBuffer(PixelBuffer::new(
                         &self.rgba_scaled,
                         dst_w,
                         dst_h,
                     )))
                 } else {
-                    Ok(Frame::PixelBuffer(PixelBuffer::new(
-                        &self.rgba,
-                        orig_w,
-                        orig_h,
-                    )))
+                    Ok(Frame::PixelBuffer(PixelBuffer::new(&self.rgba, orig_w, orig_h)))
                 }
             } else {
                 Ok(Frame::PixelBuffer(PixelBuffer::new(
                     &self.rgba,
-                    self.width(),
-                    self.height(),
+                    self.capture_width,
+                    self.capture_height,
                 )))
             }
         } else {

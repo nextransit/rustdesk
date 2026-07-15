@@ -629,7 +629,12 @@ impl VideoQoS {
             .unwrap_or(INIT_FPS);
 
         if !self.bus_mode {
-            fps = fps.max(highest_fps.min(INTERACTIVE_FPS_FLOOR));
+            let interactive_floor = if cfg!(target_os = "android") {
+                18
+            } else {
+                INTERACTIVE_FPS_FLOOR
+            };
+            fps = fps.max(highest_fps.min(interactive_floor));
         }
 
         // For new connections (within 1 second), cap fps to INIT_FPS to ensure stability

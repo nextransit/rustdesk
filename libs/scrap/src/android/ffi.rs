@@ -553,32 +553,6 @@ pub fn clear_codec_info() {
         })?;
 */
 pub fn call_main_service_pointer_input(kind: &str, mask: i32, x: i32, y: i32) -> JniResult<()> {
-    let scale = hbb_common::config::Config::get_option("mdm-scale-resolution-down-by")
-        .trim()
-        .parse::<f64>()
-        .unwrap_or(1.0)
-        .max(1.0);
-    let (mapped_x, mapped_y) = if scale > 1.001 {
-        let orig_size = crate::SCREEN_SIZE.lock().unwrap();
-        let orig_w = orig_size.0 as f64;
-        let orig_h = orig_size.1 as f64;
-        if orig_w > 0.0 && orig_h > 0.0 {
-            let mut w = (orig_w / scale) as usize;
-            let mut h = (orig_h / scale) as usize;
-            w = (w / 2) * 2;
-            h = (h / 2) * 2;
-            w = w.max(16);
-            h = h.max(16);
-            let ratio_x = orig_w / w as f64;
-            let ratio_y = orig_h / h as f64;
-            ((x as f64 * ratio_x) as i32, (y as f64 * ratio_y) as i32)
-        } else {
-            (x, y)
-        }
-    } else {
-        (x, y)
-    };
-
     if let (Some(jvm), Some(ctx)) = (
         JVM.read().unwrap().as_ref(),
         MAIN_SERVICE_CTX.read().unwrap().as_ref(),
@@ -592,8 +566,8 @@ pub fn call_main_service_pointer_input(kind: &str, mask: i32, x: i32, y: i32) ->
             &[
                 JValue::Int(kind),
                 JValue::Int(mask),
-                JValue::Int(mapped_x),
-                JValue::Int(mapped_y),
+                JValue::Int(x),
+                JValue::Int(y),
             ],
         )?;
         return Ok(());

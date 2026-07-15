@@ -433,6 +433,16 @@ impl Server {
             }
             if !noperms.contains(&(&name as _)) {
                 #[cfg(target_os = "android")]
+                if name == primary_video_service_name {
+                    android_log(
+                        "rustdesk_video",
+                        &format!(
+                            "MDM-VideoServiceSubscribe conn_id={} service={}",
+                            conn.id(), name
+                        ),
+                    );
+                }
+                #[cfg(target_os = "android")]
                 if name == audio_service::NAME {
                     log::info!("MDM-AudioServiceSubscribe conn_id={} source=add_connection", conn.id());
                     android_log("rustdesk_audio", &format!("MDM-AudioServiceSubscribe conn_id={} source=add_connection", conn.id()));
@@ -445,6 +455,25 @@ impl Server {
                     android_log("rustdesk_audio", &format!("MDM-AudioServiceSkip conn_id={} source=add_connection reason=noperms", conn.id()));
                 }
             }
+        }
+        #[cfg(target_os = "android")]
+        {
+            // Capture may have been prepared before this subscriber existed, and an
+            // earlier/stale connection can consume that refresh. Re-arm refresh at
+            // the exact subscription boundary so every authorized Android client
+            // receives a fresh display snapshot and a newly initialized keyframe.
+            self.set_video_service_opt(
+                Some((
+                    VideoSource::Monitor,
+                    *display_service::PRIMARY_DISPLAY_IDX,
+                )),
+                video_service::OPTION_REFRESH,
+                service::SERVICE_OPTION_VALUE_TRUE,
+            );
+            android_log(
+                "rustdesk_video",
+                &format!("MDM-VideoSubscriberRefresh conn_id={}", conn.id()),
+            );
         }
         #[cfg(target_os = "macos")]
         self.update_enable_retina();

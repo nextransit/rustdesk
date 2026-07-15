@@ -66,6 +66,8 @@ pub const OPTION_REFRESH: &'static str = "refresh";
 
 #[cfg(target_os = "android")]
 static ANDROID_REFRESH_EPOCH: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "android")]
+static ANDROID_REFRESH_ACK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
@@ -370,6 +372,8 @@ fn check_uac_switch(privacy_mode_id: i32, capturer_privacy_mode_id: i32) -> Resu
 
 pub(super) struct CapturerInfo {
     pub origin: (i32, i32),
+    pub display_width: usize,
+    pub display_height: usize,
     pub width: usize,
     pub height: usize,
     pub ndisplay: usize,
@@ -426,15 +430,20 @@ fn get_capturer_monitor(
         }
     }
 
-    let (origin, width, height) = (display.origin(), display.width(), display.height());
+    let (origin, display_width, display_height) =
+        (display.origin(), display.width(), display.height());
+    #[cfg(target_os = "android")]
+    let (width, height) = scrap::expected_capture_size(&display);
+    #[cfg(not(target_os = "android"))]
+    let (width, height) = (display_width, display_height);
     let name = display.name();
     log::debug!(
         "#displays={}, current={}, origin: {:?}, width={}, height={}, cpus={}/{}, name:{}",
         ndisplay,
         current,
         &origin,
-        width,
-        height,
+        display_width,
+        display_height,
         num_cpus::get_physical(),
         num_cpus::get(),
         &name,
@@ -475,8 +484,19 @@ fn get_capturer_monitor(
         current,
         portable_service_running,
     )?;
+    if width != display_width || height != display_height {
+        log::info!(
+            "capture size differs from display size, capture={}x{}, display={}x{}",
+            width,
+            height,
+            display_width,
+            display_height
+        );
+    }
     Ok(CapturerInfo {
         origin,
+        display_width,
+        display_height,
         width,
         height,
         ndisplay,
@@ -518,6 +538,8 @@ fn get_capturer_camera(current: usize) -> ResultType<CapturerInfo> {
     );
     return Ok(CapturerInfo {
         origin,
+        display_width: width,
+        display_height: height,
         width,
         height,
         ndisplay: ncamera,
@@ -572,6 +594,14 @@ fn run(vs: VideoService) -> ResultType<()> {
     let display_idx = vs.idx;
     let sp = vs.sp;
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
+    #[cfg(target_os = "android")]
+    super::android_log(
+        "rustdesk_video",
+        &format!(
+            "MDM-VideoServiceRun display={} capture={}x{}",
+            display_idx, c.width, c.height
+        ),
+    );
     #[cfg(windows)]
     if !scrap::codec::enable_directx_capture() && !c.is_gdi() {
         log::info!("disable dxgi with option, fall back to gdi");
@@ -636,6 +666,13 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     if sp.is_option_true(OPTION_REFRESH) {
         sp.set_option_bool(OPTION_REFRESH, false);
+        #[cfg(target_os = "android")]
+        if vs.source.is_monitor() {
+            let refresh_epoch = ANDROID_REFRESH_EPOCH.load(Ordering::Acquire);
+            let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
+            ANDROID_REFRESH_ACK_EPOCH.store(refresh_epoch, Ordering::Release);
+            log::info!("apply pending Android screen size refresh epoch={refresh_epoch}");
+        }
     }
 
     let mut frame_controller = VideoFrameController::new(display_idx);
@@ -660,9 +697,6 @@ fn run(vs: VideoService) -> ResultType<()> {
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
-    #[cfg(target_os = "android")]
-    let android_refresh_epoch = ANDROID_REFRESH_EPOCH.load(Ordering::Acquire);
-
     // — 公交车载: 静态画面帧跳过 —
     // 车辆静止时画面几乎不变, 跳过编码可节省 80-90% 流量.
     // last_yuv_hash: 前帧 YUV 数据的采样哈希, 用于判断画面是否变化.
@@ -672,10 +706,15 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     while sp.ok() {
         #[cfg(target_os = "android")]
-        if ANDROID_REFRESH_EPOCH.load(Ordering::Acquire) != android_refresh_epoch {
-            let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
-            log::info!("switch due to Android screen size refresh");
-            bail!("SWITCH");
+        {
+            let refresh_epoch = ANDROID_REFRESH_EPOCH.load(Ordering::Acquire);
+            if refresh_epoch != ANDROID_REFRESH_ACK_EPOCH.load(Ordering::Acquire) {
+                sp.set_option_bool(OPTION_REFRESH, false);
+                let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
+                ANDROID_REFRESH_ACK_EPOCH.store(refresh_epoch, Ordering::Release);
+                log::info!("switch due to Android screen size refresh epoch={refresh_epoch}");
+                bail!("SWITCH");
+            }
         }
         #[cfg(windows)]
         check_uac_switch(c.privacy_mode_id, c._capturer_privacy_mode_id)?;
@@ -689,6 +728,7 @@ fn run(vs: VideoService) -> ResultType<()> {
             &sp.name(),
         )?;
         if sp.is_option_true(OPTION_REFRESH) {
+            sp.set_option_bool(OPTION_REFRESH, false);
             if vs.source.is_monitor() {
                 let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
             }
@@ -805,6 +845,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                     // 对 YUV 数据进行均匀采样比较, 如果画面无显著变化且强制刷新周期未到, 跳过编码.
                     {
                         let video_qos = VIDEO_QOS.lock().unwrap();
+                        #[cfg(target_os = "android")]
+                        let skip = false;
+                        #[cfg(not(target_os = "android"))]
                         let skip = video_qos.is_bus_mode() && !first_frame;
                         drop(video_qos);
                         if skip {
@@ -940,7 +983,7 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let mut fetched_conn_ids = HashSet::new();
         let timeout_millis = if cfg!(target_os = "android") {
-            spf.as_millis().clamp(10, 100) as u64
+            10u64
         } else {
             3_000u64
         };
@@ -1219,9 +1262,19 @@ fn handle_one_frame(
     sp.snapshot(|sps| {
         // so that new sub and old sub share the same encoder after switch
         if sps.has_subscribes() {
+            #[cfg(target_os = "android")]
+            super::android_log(
+                "rustdesk_video",
+                "MDM-VideoSubscriberSnapshot action=switch_encoder",
+            );
             log::info!("switch due to new subscriber");
             bail!("SWITCH");
         }
+        #[cfg(target_os = "android")]
+        super::android_log(
+            "rustdesk_video",
+            "MDM-VideoSubscriberSnapshot action=promote_first_subscriber",
+        );
         Ok(())
     })?;
 
@@ -1240,6 +1293,16 @@ fn handle_one_frame(
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
             send_conn_ids = sp.send_video_frame(msg);
+            #[cfg(target_os = "android")]
+            if first {
+                super::android_log(
+                    "rustdesk_video",
+                    &format!(
+                        "MDM-VideoFirstFrame display={} subscribers={:?} size={}x{}",
+                        display, send_conn_ids, width, height
+                    ),
+                );
+            }
         }
         Err(e) => {
             *encode_fail_counter += 1;
@@ -1281,6 +1344,13 @@ pub fn refresh() {
     {
         Display::refresh_size();
         ANDROID_REFRESH_EPOCH.fetch_add(1, Ordering::AcqRel);
+        if let Some(server) = super::active_server() {
+            server.read().unwrap().set_video_service_opt(
+                None,
+                OPTION_REFRESH,
+                super::service::SERVICE_OPTION_VALUE_TRUE,
+            );
+        }
     }
 }
 
@@ -1315,11 +1385,25 @@ fn try_broadcast_display_changed(
         // Get display information immediately.
         crate::display_service::check_displays_changed().ok();
     }
-    if let Some(display) = check_display_changed(
+    let display = check_display_changed(
         cap.ndisplay,
         cap.current,
-        (cap.origin.0, cap.origin.1, cap.width, cap.height),
-    ) {
+        (
+            cap.origin.0,
+            cap.origin.1,
+            cap.display_width,
+            cap.display_height,
+        ),
+    );
+    #[cfg(target_os = "android")]
+    let display = display.or_else(|| {
+        if refresh {
+            crate::display_service::get_display_info(display_idx)
+        } else {
+            None
+        }
+    });
+    if let Some(display) = display {
         log::info!("Display {} changed", display);
         if let Some(msg_out) =
             make_display_changed_msg(display_idx, Some(display), VideoSource::Monitor)

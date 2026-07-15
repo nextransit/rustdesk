@@ -2939,17 +2939,38 @@ impl Connection {
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }
-                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    #[cfg(target_os = "android")]
                     {
-                        log::info!(
-                            "MDM-InputDispatch type=mouse mask={} x={} y={}",
-                            me.mask,
-                            me.x,
-                            me.y
+                        android_log(
+                            "rustdesk_input",
+                            &format!(
+                                "MDM-InputIngress stage=connection_received type=mouse conn_id={} mask={} x={} y={}",
+                                self.inner.id(), me.mask, me.x, me.y
+                            ),
                         );
-                        if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
-                            log::warn!("MDM-InputDispatchFailed type=mouse error={}", e);
+                        match call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
+                            Ok(()) => android_log(
+                                "rustdesk_input",
+                                &format!(
+                                    "MDM-InputIngress stage=jni_dispatched type=mouse conn_id={} mask={} x={} y={}",
+                                    self.inner.id(), me.mask, me.x, me.y
+                                ),
+                            ),
+                            Err(e) => {
+                                android_log(
+                                    "rustdesk_input",
+                                    &format!(
+                                        "MDM-InputIngress stage=jni_failed type=mouse conn_id={} mask={} x={} y={} error={}",
+                                        self.inner.id(), me.mask, me.x, me.y, e
+                                    ),
+                                );
+                                log::warn!("MDM-InputDispatchFailed type=mouse error={}", e);
+                            }
                         }
+                    }
+                    #[cfg(target_os = "ios")]
+                    if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
+                        log::warn!("MDM-InputDispatchFailed type=mouse error={}", e);
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {

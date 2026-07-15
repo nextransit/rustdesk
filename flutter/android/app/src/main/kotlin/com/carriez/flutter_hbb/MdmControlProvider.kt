@@ -36,6 +36,7 @@ class MdmControlProvider : ContentProvider() {
                 METHOD_START_SERVICE -> startService(extras)
                 METHOD_REQUEST_MEDIA_PROJECTION -> requestMediaProjection()
                 METHOD_SWITCH_MDM_SCREENRECORD -> switchMdmScreenrecord(extras)
+                METHOD_STOP_CAPTURE -> stopCapture()
                 METHOD_STOP_SERVICE -> stopService()
                 METHOD_SERVICE_STATUS -> serviceStatus()
                 METHOD_GET_IDENTITY -> getIdentity()
@@ -360,15 +361,7 @@ class MdmControlProvider : ContentProvider() {
             .lowercase()
             .takeIf { it in setOf("auto", "vp8", "vp9", "av1", "h264", "h265") }
             ?: "h264"
-        val codec = if (
-            Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q &&
-            requestedCodec in setOf("auto", "h264", "h265")
-        ) {
-            Log.w(TAG, "MDM managed codec fallback: requested=$requestedCodec effective=vp8 sdk=${Build.VERSION.SDK_INT}")
-            "vp8"
-        } else {
-            requestedCodec
-        }
+        val codec = requestedCodec
         val audioEnabled = extras.booleanExtra(EXTRA_AUDIO_ENABLED, false)
         val fileTransferEnabled = extras.booleanExtra(EXTRA_FILE_TRANSFER_ENABLED, false)
         val tcpTunnelEnabled = extras.booleanExtra(EXTRA_TCP_TUNNEL_ENABLED, false)
@@ -571,6 +564,17 @@ class MdmControlProvider : ContentProvider() {
             } else {
                 putString(KEY_ERROR, "mdm screenrecord source not ready")
             }
+        }
+    }
+
+    private fun stopCapture(): Bundle {
+        val ok = MainService.stopManagedCapture()
+        return Bundle().apply {
+            putBoolean(KEY_SUCCESS, ok)
+            putBoolean(KEY_STATUS_CAPTURING, MainService.isCapturing)
+            putBoolean(KEY_STATUS_MEDIA_READY, MainService.isReady)
+            putString(KEY_STATUS_CAPTURE_SOURCE, MainService.captureSource)
+            if (ok) putString(KEY_PATH, "capture stopped")
         }
     }
 
@@ -830,6 +834,7 @@ class MdmControlProvider : ContentProvider() {
         private const val METHOD_START_SERVICE = "start_service"
         private const val METHOD_REQUEST_MEDIA_PROJECTION = "request_media_projection"
         private const val METHOD_SWITCH_MDM_SCREENRECORD = "switch_mdm_screenrecord"
+        private const val METHOD_STOP_CAPTURE = "stop_capture"
         private const val METHOD_STOP_SERVICE = "stop_service"
         private const val METHOD_SERVICE_STATUS = "service_status"
         private const val METHOD_GET_IDENTITY = "get_identity"
