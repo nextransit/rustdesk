@@ -58,7 +58,12 @@ lazy_static! {
 const MAX_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_AUDIO_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
 const RAW_FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(66);
+// Android 9 的 managed screenrecord 在静态页面上只会偶尔产出真实新帧，
+// RustDesk 需要复用最后一帧维持 Dashboard 配置的发送帧率。66ms 只够
+// 15 FPS；当会话提升到 20 FPS（50ms 周期）时会一帧允许、一帧拒绝，
+// 实测 Web 解码被精确压成约 10 FPS。允许最多 30 FPS 的重复帧节奏，
+// 最终发送速率仍由 VideoQoS::spf() 的会话上限控制。
+const FORCE_DUPLICATE_VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 struct FrameRaw {
     name: &'static str,

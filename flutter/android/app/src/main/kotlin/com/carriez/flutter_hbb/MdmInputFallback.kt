@@ -8,7 +8,6 @@ import android.view.KeyEvent as KeyEventAndroid
 import hbb.KeyEventConverter
 import hbb.MessageOuterClass.KeyEvent
 import hbb.MessageOuterClass.KeyboardMode
-import kotlin.math.max
 
 object MdmInputFallback {
     private const val TAG = "MdmInputFallback"
@@ -23,16 +22,18 @@ object MdmInputFallback {
     }
 
     fun pointer(context: Context, kind: Int, mask: Int, x: Int, y: Int): Boolean {
-        val scaledX = max(0, x) * SCREEN_INFO.scale
-        val scaledY = max(0, y) * SCREEN_INFO.scale
         val result = callProvider(
             context,
             METHOD_POINTER,
             Bundle().apply {
                 putInt("kind", kind)
                 putInt("mask", mask)
-                putInt("x", scaledX)
-                putInt("y", scaledY)
+                // x/y are already Android logical display coordinates. The
+                // provider owns physical-display bounds validation and must see
+                // the original values so it can reject, rather than hide, an
+                // out-of-bounds mapping defect.
+                putInt("x", x)
+                putInt("y", y)
             }
         )
         return result?.getBoolean(KEY_SUCCESS, false) == true

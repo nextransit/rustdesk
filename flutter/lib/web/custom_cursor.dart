@@ -115,7 +115,9 @@ MouseCursor buildCursorOfCache(
           "Register custom cursor with key $key (${cache.hotx},${cache.hoty})");
       CursorManager.instance.registerCursor(CursorData(
           key: key,
-          url: 'data:image/rgba;base64,${base64Encode(data)}',
+          // CursorData.data is PNG on Web. image/rgba is not a browser cursor
+          // image type and Chrome silently falls back to an unrelated cursor.
+          url: 'data:image/png;base64,${base64Encode(data)}',
           width: (cache.width * cache.scale).toInt(),
           height: (cache.height * cache.scale).toInt(),
           hotX: cache.hotx,

@@ -71,9 +71,12 @@ class MainService : Service() {
         if (!powerManager.isInteractive && (kind == 0 || mask == LEFT_DOWN)) {
             ensureScreenInteractive("pointer_input")
         }
-        val mapped = mapRemoteInputToScreen(x, y)
-        val mappedX = mapped.first
-        val mappedY = mapped.second
+        // RustDesk Web has already converted the rendered canvas point into the
+        // Android logical display coordinate space. Keep the JNI boundary as a
+        // pure transport boundary: a second capture-size conversion here makes
+        // the same pointer jump whenever the managed capture size changes.
+        val mappedX = x
+        val mappedY = y
         if (MdmInputFallback.isAvailable(applicationContext)) {
             Log.i(
                 logTag,
@@ -87,7 +90,11 @@ class MainService : Service() {
         }
         val inputService = InputService.ctx
         if (inputService != null) {
-            Log.i(logTag, "MDM-InputDispatch pointer_route=accessibility kind=$kind mask=$mask")
+            Log.i(
+                logTag,
+                "MDM-InputDispatch pointer_route=accessibility kind=$kind mask=$mask " +
+                    "raw_x=$x raw_y=$y x=$mappedX y=$mappedY"
+            )
             when (kind) {
                 0 -> { // touch
                     inputService.onTouchInput(mask, mappedX, mappedY)
@@ -102,25 +109,6 @@ class MainService : Service() {
             return
         }
         Log.w(logTag, "MDM-InputDispatch pointer_route=unavailable kind=$kind mask=$mask")
-    }
-
-    private fun mapRemoteInputToScreen(x: Int, y: Int): Pair<Int, Int> {
-        val maxX = (SCREEN_INFO.width - 1).coerceAtLeast(0)
-        val maxY = (SCREEN_INFO.height - 1).coerceAtLeast(0)
-        val captureSize = currentCaptureSizeForRustDesk()
-        val captureMaxX = (captureSize.first - 1).coerceAtLeast(0)
-        val captureMaxY = (captureSize.second - 1).coerceAtLeast(0)
-        if (
-            captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD &&
-            captureMaxX > 0 &&
-            captureMaxY > 0 &&
-            (captureMaxX != maxX || captureMaxY != maxY)
-        ) {
-            val mappedX = ((x.coerceIn(0, captureMaxX).toLong() * maxX + captureMaxX / 2) / captureMaxX).toInt()
-            val mappedY = ((y.coerceIn(0, captureMaxY).toLong() * maxY + captureMaxY / 2) / captureMaxY).toInt()
-            return Pair(mappedX, mappedY)
-        }
-        return Pair(x.coerceIn(0, maxX), y.coerceIn(0, maxY))
     }
 
     @Keep
@@ -1555,6 +1543,117 @@ class MainService : Service() {
         }
     }
 
+    /**
+     * Rebuild only the Annex-B H.264 decoder/feed path while keeping the active
+     * RustDesk session, raw-frame buffer, audio recorder and last RGBA frame.
+     *
+     * Android 9 MTK decoders can hold several access units on a static screen.
+     * The old watchdog treated that as a capture failure and called the full
+     * switchToMdmSystemScreenrecordCapture(forceRestart=true) path. That path
+     * disables video, tears down audio and clears the cached frame, creating the
+     * exact five-second Dashboard interruption it was meant to repair.
+     *
+     * VIDEO_RAW intentionally retains the last frame, so Rust continues sending
+     * duplicate keepalive frames while this decoder-only recovery runs.
+     */
+    @Synchronized
+    private fun restartMdmScreenrecordDecoder(reason: String): Boolean {
+        if (!_isStart || captureSourceValue != CAPTURE_SOURCE_MDM_SCREENRECORD) {
+            Log.w(logTag, "MDM-DecoderRecovery skipped reason=$reason capture_inactive")
+            return false
+        }
+
+        val screenFile = java.io.File(
+            "/sdcard/Android/data/com.decard.mdm.agent/files/system_screen.h264"
+        )
+        if (!screenFile.exists() || screenFile.length() < 1024L) {
+            Log.w(
+                logTag,
+                "MDM-DecoderRecovery skipped reason=$reason source_unavailable " +
+                    "exists=${screenFile.exists()} size=${screenFile.length()}"
+            )
+            return false
+        }
+
+        val oldFeedThread = mdmScreenrecordThread
+        val oldKeepaliveThread = mdmKeepaliveThread
+        val oldDecoder = mdmDecoder
+        val oldDecoderStarted = mdmDecoderStarted
+        val cachedFrameAvailable = mdmLastRgbaFrame != null
+        val startedAtMs = System.currentTimeMillis()
+
+        mdmScreenrecordThread = null
+        mdmKeepaliveThread = null
+        mdmDecoder = null
+        mdmDecoderStarted = false
+
+        if (oldFeedThread != null && oldFeedThread !== Thread.currentThread()) {
+            try {
+                oldFeedThread.join(1_500L)
+                if (oldFeedThread.isAlive) {
+                    Log.w(logTag, "MDM-DecoderRecovery old feed still alive reason=$reason")
+                }
+            } catch (_: Throwable) {}
+        }
+        if (oldKeepaliveThread != null && oldKeepaliveThread !== Thread.currentThread()) {
+            try {
+                oldKeepaliveThread.join(1_000L)
+            } catch (_: Throwable) {}
+        }
+        if (oldDecoderStarted) {
+            runCatching { oldDecoder?.stop() }
+                .onFailure { Log.w(logTag, "MDM-DecoderRecovery stop failed: ${it.message}") }
+        }
+        runCatching { oldDecoder?.release() }
+            .onFailure { Log.w(logTag, "MDM-DecoderRecovery release failed: ${it.message}") }
+
+        return try {
+            val (frameWidth, frameHeight) = readMdmScreenrecordMeta()
+            val videoFormat = MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC,
+                frameWidth,
+                frameHeight
+            ).apply {
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024)
+                setInteger(
+                    MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+                )
+            }
+            val decoder = createAndStartMdmScreenrecordDecoder(
+                videoFormat,
+                frameWidth,
+                frameHeight
+            )
+            mdmDecoder = decoder
+            mdmDecoderStarted = true
+            mdmDecoderOutputImageUnavailableLogged = false
+            mdmDecoderInputCountAtLastOutput = mdmDecoderInputCount.get()
+            // Give the replacement decoder a full watchdog window to consume its
+            // bootstrap access units. The cached RGBA frame remains live meanwhile.
+            mdmLastDecodedFramePublishedAtMs = System.currentTimeMillis()
+            mdmBootstrapInProgress = false
+            mdmPendingBootstrapFrame = null
+            mdmCaptureWidth = frameWidth
+            mdmCaptureHeight = frameHeight
+            startMdmScreenrecordFeedThread(screenFile, decoder)
+            startMdmKeepaliveThread(decoder)
+            FFI.refreshScreen()
+            Log.i(
+                logTag,
+                "MDM-DecoderRecovery completed reason=$reason " +
+                    "elapsed_ms=${System.currentTimeMillis() - startedAtMs} " +
+                    "cached_frame=$cachedFrameAvailable dimensions=${frameWidth}x$frameHeight"
+            )
+            true
+        } catch (e: Throwable) {
+            Log.e(logTag, "MDM-DecoderRecovery failed reason=$reason: ${e.message}", e)
+            mdmDecoder = null
+            mdmDecoderStarted = false
+            false
+        }
+    }
+
     private fun readMdmScreenrecordMeta(): Pair<Int, Int> {
         return readMdmScreenrecordMetaFromFile(logFailure = true)
             ?: Pair(SCREEN_INFO.width, SCREEN_INFO.height)
@@ -2005,10 +2104,12 @@ class MainService : Service() {
                             System.currentTimeMillis() - mdmLastDecodedFramePublishedAtMs >=
                                 MDM_DECODE_STALL_RECOVERY_MS
                         ) {
-                            switchToMdmSystemScreenrecordCapture(
-                                "decoder_output_stall",
-                                forceRestart = true
-                            )
+                            if (!restartMdmScreenrecordDecoder("decoder_output_stall")) {
+                                switchToMdmSystemScreenrecordCapture(
+                                    "decoder_output_stall_fallback",
+                                    forceRestart = true
+                                )
+                            }
                         }
                     }, "mdm-screenrecord-decoder-stall-recovery").start()
                     return@Thread

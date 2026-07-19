@@ -31,6 +31,7 @@ class MdmControlProvider : ContentProvider() {
         return try {
             when (method) {
                 METHOD_SET_SERVER_CONFIG -> setServerConfig(extras)
+                METHOD_SET_AUDIO_ENABLED -> setAudioEnabled(extras)
                 METHOD_SET_SESSION_PASSWORD -> setSessionPassword(extras)
                 METHOD_CLEAR_SESSION_PASSWORD -> clearSessionPassword()
                 METHOD_START_SERVICE -> startService(extras)
@@ -92,7 +93,13 @@ class MdmControlProvider : ContentProvider() {
         val options = linkedMapOf(
             "custom-rendezvous-server" to hbbs,
             "relay-server" to hbbr,
-            "key" to key
+            "key" to key,
+            // Managed Dashboard sessions must stay connected while the operator
+            // watches a static screen. A persisted RustDesk desktop setting can
+            // otherwise close the incoming session after one idle minute; Rust
+            // then emits stop_capture and the Web client enters a reconnect loop.
+            "allow-auto-disconnect" to "N",
+            "auto-disconnect-timeout" to "0"
         )
         options.putAll(managedWebRtcOptions(extras))
         if (extras?.containsKey(EXTRA_MAX_FPS) == true) {
@@ -117,6 +124,7 @@ class MdmControlProvider : ContentProvider() {
                 "bitrate=${options["mdm-max-bitrate-bps"].orEmpty()} " +
                 "webrtc=${options["mdm-webrtc-transport"].orEmpty()} " +
                 "icePolicy=${options["mdm-webrtc-ice-transport"].orEmpty()} " +
+                "autoDisconnect=${options["allow-auto-disconnect"].orEmpty()} " +
                 "audio=$audioEnabled runtimeAudioApplied=$runtimeAudioApplied"
         )
         if (startServer) {
@@ -129,6 +137,45 @@ class MdmControlProvider : ContentProvider() {
         }
         return success(File(appDir, RUSTDESK2_TOML)).apply {
             putString(KEY_STATUS_WEBRTC_CAPABILITIES, webRtcCapabilities(appDir))
+        }
+    }
+
+    /**
+     * Hot-switch managed session audio without restarting the RustDesk server.
+     *
+     * set_server_config historically calls FFI.startServer(). Reusing it for an
+     * audio toggle tears down the active capture/connection and causes a visible
+     * video interruption. Audio is an independent runtime plane: update the two
+     * RustDesk options, persist the managed flag, then start/stop only the active
+     * audio recorder.
+     */
+    private fun setAudioEnabled(extras: Bundle?): Bundle {
+        val audioEnabled = extras?.getBoolean(EXTRA_AUDIO_ENABLED, false) ?: false
+        val appDir = configDir()
+        val options = linkedMapOf(
+            "enable-audio" to if (audioEnabled) "Y" else "N",
+            "disable-audio" to if (audioEnabled) "N" else "Y",
+            "mdm-audio-enabled" to if (audioEnabled) "Y" else "N"
+        )
+        val failed = options.filterNot { (optionKey, optionValue) ->
+            FFI.setOption(appDir.absolutePath, optionKey, optionValue)
+        }.keys
+        require(failed.isEmpty()) {
+            "set RustDesk audio options failed: ${failed.joinToString(",")}"
+        }
+        context?.getSharedPreferences(KEY_SHARED_PREFERENCES, Context.MODE_PRIVATE)
+            ?.edit()
+            ?.putBoolean(KEY_MDM_AUDIO_ENABLED, audioEnabled)
+            ?.apply()
+        val runtimeAudioApplied = MainService.applyMdmAudioEnabled(audioEnabled)
+        Log.i(
+            TAG,
+            "MDM audio hot switch applied audio=$audioEnabled " +
+                "runtimeAudioApplied=$runtimeAudioApplied serverRestarted=false"
+        )
+        return success(File(appDir, RUSTDESK2_TOML)).apply {
+            putBoolean(KEY_STATUS_AUDIO_ENABLED, audioEnabled)
+            putBoolean(KEY_STATUS_AUDIO_RUNNING, audioEnabled && runtimeAudioApplied)
         }
     }
 
@@ -381,6 +428,10 @@ class MdmControlProvider : ContentProvider() {
             "image_quality" to imageQuality,
             "custom_image_quality" to customImageQuality.toString(),
             "custom-fps" to maxFps.toString(),
+            // MDM profile 已明确给出 max bitrate / fps；避免通用 ABR 再把
+            // Android 9 relay 会话二次降帧到配置值的一半。
+            "enable-abr" to "N",
+            "enable-abr-fps" to "N",
             "enable-audio" to boolOption(audioEnabled),
             "audio-input" to "",
             "enable-file-transfer" to boolOption(fileTransferEnabled),
@@ -829,6 +880,7 @@ class MdmControlProvider : ContentProvider() {
         private const val RUSTDESK_PACKAGE_NAME = "com.carriez.flutter_hbb"
 
         private const val METHOD_SET_SERVER_CONFIG = "set_server_config"
+        private const val METHOD_SET_AUDIO_ENABLED = "set_audio_enabled"
         private const val METHOD_SET_SESSION_PASSWORD = "set_session_password"
         private const val METHOD_CLEAR_SESSION_PASSWORD = "clear_session_password"
         private const val METHOD_START_SERVICE = "start_service"

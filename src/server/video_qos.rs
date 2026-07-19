@@ -126,6 +126,7 @@ pub struct VideoQoS {
     bitrate_store: u32,
     adjust_ratio_instant: Instant,
     abr_config: bool,
+    abr_fps_config: bool,
     new_user_instant: Instant,
     diagnostic_log_instant: Instant,
     /// true 时启用公交车载超低带宽模式:
@@ -145,6 +146,7 @@ impl Default for VideoQoS {
             bitrate_store: 0,
             adjust_ratio_instant: Instant::now(),
             abr_config: true,
+            abr_fps_config: true,
             new_user_instant: Instant::now(),
             diagnostic_log_instant: Instant::now(),
             bus_mode: false,
@@ -229,6 +231,7 @@ impl VideoQoS {
     pub fn on_connection_open(&mut self, id: i32) {
         self.users.insert(id, UserData::default());
         self.abr_config = Config::get_option("enable-abr") != "N";
+        self.abr_fps_config = Config::get_option("enable-abr-fps") != "N";
         self.new_user_instant = Instant::now();
         if self.bus_mode {
             let bus_init = BUS_INIT_FPS.min(BUS_MAX_FPS).max(MIN_FPS);
@@ -236,9 +239,11 @@ impl VideoQoS {
             self.ratio = BR_BUS_LOW;
         }
         log::warn!(
-            "MDM-QoS connection_open id={} bus_mode={} fps={}",
+            "MDM-QoS connection_open id={} bus_mode={} abr={} abr_fps={} fps={}",
             id,
             self.bus_mode,
+            self.abr_config,
+            self.abr_fps_config,
             self.fps
         );
     }
@@ -262,6 +267,14 @@ impl VideoQoS {
     }
 
     pub fn user_auto_adjust_fps(&mut self, id: i32, fps: u32) {
+        if !self.abr_fps_config {
+            log::warn!(
+                "MDM-QoS auto_adjust_fps ignored id={} fps={} abr_fps=false",
+                id,
+                fps
+            );
+            return;
+        }
         if fps < MIN_FPS || fps > MAX_FPS {
             return;
         }
@@ -300,6 +313,20 @@ impl VideoQoS {
     }
 
     pub fn user_network_delay(&mut self, id: i32, delay: u32) {
+        if !self.abr_fps_config {
+            self.adjust_fps();
+            if self.diagnostic_log_instant.elapsed() >= Duration::from_secs(1) {
+                log::warn!(
+                    "MDM-QoS network_delay ignored_for_fps id={} sample_ms={} abr_fps=false final_fps={} highest_fps={}",
+                    id,
+                    delay,
+                    self.fps,
+                    self.highest_fps()
+                );
+                self.diagnostic_log_instant = Instant::now();
+            }
+            return;
+        }
         let highest_fps = self.highest_fps();
         let target_ratio = self.latest_quality().ratio();
         let mut diagnostic: Option<(u32, u32, u32)> = None;
@@ -421,6 +448,9 @@ impl VideoQoS {
     }
 
     pub fn user_delay_response_elapsed(&mut self, id: i32, elapsed: u128) {
+        if !self.abr_fps_config {
+            return;
+        }
         if let Some(user) = self.users.get_mut(&id) {
             user.delay.response_delayed = elapsed > 2000;
             if user.delay.response_delayed {
@@ -620,6 +650,29 @@ impl VideoQoS {
         } else {
             self.highest_fps()
         };
+        if !self.abr_fps_config {
+            let init_limit = if self.bus_mode {
+                BUS_INIT_FPS
+            } else {
+                INIT_FPS
+            };
+            let target_fps = if self.new_user_instant.elapsed().as_secs() < 1 {
+                highest_fps.min(init_limit)
+            } else {
+                highest_fps
+            };
+            self.fps = target_fps.clamp(MIN_FPS, highest_fps);
+            if old_fps != self.fps {
+                log::warn!(
+                    "MDM-QoS adjust_fps fixed old={} new={} highest={} bus_mode={} abr_fps=false",
+                    old_fps,
+                    self.fps,
+                    highest_fps,
+                    self.bus_mode
+                );
+            }
+            return;
+        }
         // Get minimum fps from all users
         let mut fps = self
             .users
@@ -797,5 +850,20 @@ mod tests {
         qos.adjust_fps();
 
         assert_eq!(qos.fps(), INTERACTIVE_FPS_FLOOR);
+    }
+
+    #[test]
+    fn disabled_abr_fps_keeps_explicit_session_fps() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.abr_fps_config = false;
+        qos.user_custom_fps(1, 20);
+        qos.new_user_instant = Instant::now() - Duration::from_secs(2);
+
+        qos.user_auto_adjust_fps(1, 5);
+        qos.user_network_delay(1, 900);
+
+        assert_eq!(qos.fps(), 20);
+        assert_eq!(qos.users.get(&1).unwrap().auto_adjust_fps, None);
     }
 }
