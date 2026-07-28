@@ -83,8 +83,17 @@ class MainService : Service() {
                 "MDM-InputDispatch pointer_route=provider_fallback kind=$kind mask=$mask " +
                     "raw_x=$x raw_y=$y x=$mappedX y=$mappedY"
             )
-            if (MdmInputFallback.pointer(applicationContext, kind, mask, mappedX, mappedY)) {
-                return
+            when (MdmInputFallback.pointer(applicationContext, kind, mask, mappedX, mappedY)) {
+                MdmInputFallback.PointerResult.HANDLED -> return
+                MdmInputFallback.PointerResult.REJECTED_OUT_OF_BOUNDS -> {
+                    Log.e(
+                        logTag,
+                        "MDM-InputDispatch pointer_route=provider_rejected_out_of_bounds " +
+                            "kind=$kind mask=$mask x=$mappedX y=$mappedY"
+                    )
+                    return
+                }
+                MdmInputFallback.PointerResult.FAILED -> Unit
             }
             Log.w(logTag, "MDM-InputDispatch provider_fallback_failed kind=$kind mask=$mask")
         }
@@ -1545,7 +1554,8 @@ class MainService : Service() {
 
     /**
      * Rebuild only the Annex-B H.264 decoder/feed path while keeping the active
-     * RustDesk session, raw-frame buffer, audio recorder and last RGBA frame.
+     * RustDesk session and audio recorder. The last RGBA frame is retained only
+     * when the replacement decoder keeps the same capture dimensions.
      *
      * Android 9 MTK decoders can hold several access units on a static screen.
      * The old watchdog treated that as a capture failure and called the full
@@ -1553,8 +1563,8 @@ class MainService : Service() {
      * disables video, tears down audio and clears the cached frame, creating the
      * exact five-second Dashboard interruption it was meant to repair.
      *
-     * VIDEO_RAW intentionally retains the last frame, so Rust continues sending
-     * duplicate keepalive frames while this decoder-only recovery runs.
+     * For same-size recovery, VIDEO_RAW intentionally retains the last frame so
+     * Rust continues sending duplicate keepalive frames while recovery runs.
      */
     @Synchronized
     private fun restartMdmScreenrecordDecoder(reason: String): Boolean {
@@ -1580,6 +1590,8 @@ class MainService : Service() {
         val oldDecoder = mdmDecoder
         val oldDecoderStarted = mdmDecoderStarted
         val cachedFrameAvailable = mdmLastRgbaFrame != null
+        val oldCaptureWidth = mdmCaptureWidth
+        val oldCaptureHeight = mdmCaptureHeight
         val startedAtMs = System.currentTimeMillis()
 
         mdmScreenrecordThread = null
@@ -1625,6 +1637,23 @@ class MainService : Service() {
                 frameWidth,
                 frameHeight
             )
+            val dimensionsChanged = oldCaptureWidth <= 0 ||
+                oldCaptureHeight <= 0 ||
+                oldCaptureWidth != frameWidth ||
+                oldCaptureHeight != frameHeight
+            if (dimensionsChanged) {
+                // A cached RGBA frame is valid only for the dimensions it was
+                // decoded with. refreshScreen() can recreate the Rust capturer
+                // immediately, so clear both Java and Rust raw-frame caches
+                // before advertising a different capture size.
+                mdmLastRgbaFrame = null
+                mdmLastFrameOutputAtMs = 0L
+                mdmKeepaliveFrameCount = 0L
+                mdmLastFrameScratch = null
+                mdmPendingFrameScratch = null
+                FFI.setFrameRawEnable("video", false)
+                FFI.setFrameRawEnable("video", true)
+            }
             mdmDecoder = decoder
             mdmDecoderStarted = true
             mdmDecoderOutputImageUnavailableLogged = false
@@ -1643,7 +1672,10 @@ class MainService : Service() {
                 logTag,
                 "MDM-DecoderRecovery completed reason=$reason " +
                     "elapsed_ms=${System.currentTimeMillis() - startedAtMs} " +
-                    "cached_frame=$cachedFrameAvailable dimensions=${frameWidth}x$frameHeight"
+                    "cached_frame=$cachedFrameAvailable " +
+                    "cached_frame_preserved=${cachedFrameAvailable && !dimensionsChanged} " +
+                    "old_dimensions=${oldCaptureWidth}x$oldCaptureHeight " +
+                    "dimensions=${frameWidth}x$frameHeight"
             )
             true
         } catch (e: Throwable) {

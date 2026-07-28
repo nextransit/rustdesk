@@ -10,18 +10,26 @@ import hbb.MessageOuterClass.KeyEvent
 import hbb.MessageOuterClass.KeyboardMode
 
 object MdmInputFallback {
+    enum class PointerResult {
+        HANDLED,
+        REJECTED_OUT_OF_BOUNDS,
+        FAILED
+    }
+
     private const val TAG = "MdmInputFallback"
     private const val AUTHORITY = "com.decard.mdm.agent.rustdesk.input"
     private const val METHOD_POINTER = "pointer"
     private const val METHOD_KEY = "key"
     private const val METHOD_STATUS = "status"
     private const val KEY_SUCCESS = "success"
+    private const val KEY_ERROR = "error"
+    private const val KEY_REJECTED_OUT_OF_BOUNDS = "rejected_out_of_bounds"
 
     fun isAvailable(context: Context): Boolean {
         return callProvider(context, METHOD_STATUS, Bundle())?.getBoolean(KEY_SUCCESS, false) == true
     }
 
-    fun pointer(context: Context, kind: Int, mask: Int, x: Int, y: Int): Boolean {
+    fun pointer(context: Context, kind: Int, mask: Int, x: Int, y: Int): PointerResult {
         val result = callProvider(
             context,
             METHOD_POINTER,
@@ -35,8 +43,17 @@ object MdmInputFallback {
                 putInt("x", x)
                 putInt("y", y)
             }
-        )
-        return result?.getBoolean(KEY_SUCCESS, false) == true
+        ) ?: return PointerResult.FAILED
+        if (result.getBoolean(KEY_SUCCESS, false)) {
+            return PointerResult.HANDLED
+        }
+        val rejectedOutOfBounds = result.getBoolean(KEY_REJECTED_OUT_OF_BOUNDS, false) ||
+            result.getString(KEY_ERROR)?.startsWith("pointer out of bounds:") == true
+        return if (rejectedOutOfBounds) {
+            PointerResult.REJECTED_OUT_OF_BOUNDS
+        } else {
+            PointerResult.FAILED
+        }
     }
 
     fun key(context: Context, input: ByteArray): Boolean {
