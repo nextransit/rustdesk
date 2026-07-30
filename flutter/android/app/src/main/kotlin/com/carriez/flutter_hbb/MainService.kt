@@ -27,6 +27,7 @@ import android.hardware.display.VirtualDisplay
 import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.wifi.WifiManager
 import android.os.*
 import android.util.DisplayMetrics
 import android.util.Log
@@ -263,6 +264,16 @@ class MainService : Service() {
 
     private val powerManager: PowerManager by lazy { applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val wakeLock: PowerManager.WakeLock by lazy { powerManager.newWakeLock(PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "rustdesk:wakelock")}
+    private val wifiManager: WifiManager by lazy {
+        applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+    }
+    @Suppress("DEPRECATION")
+    private val remoteSessionWifiLock: WifiManager.WifiLock by lazy {
+        wifiManager.createWifiLock(
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+            "rustdesk:remote-session"
+        ).apply { setReferenceCounted(false) }
+    }
 
     private fun ensureScreenInteractive(reason: String) {
         if (powerManager.isInteractive && wakeLock.isHeld) {
@@ -291,6 +302,28 @@ class MainService : Service() {
         if (wakeLock.isHeld) {
             Log.d(logTag, "Release screen wake lock for $reason")
             wakeLock.release()
+        }
+    }
+
+    private fun acquireRemoteSessionWifiLock(reason: String) {
+        runCatching {
+            if (!remoteSessionWifiLock.isHeld) {
+                remoteSessionWifiLock.acquire()
+                Log.i(logTag, "MDM-WifiLock acquired mode=high_perf reason=$reason")
+            }
+        }.onFailure {
+            Log.w(logTag, "MDM-WifiLock acquire failed reason=$reason error=${it.message}")
+        }
+    }
+
+    private fun releaseRemoteSessionWifiLock(reason: String) {
+        runCatching {
+            if (remoteSessionWifiLock.isHeld) {
+                remoteSessionWifiLock.release()
+                Log.i(logTag, "MDM-WifiLock released reason=$reason")
+            }
+        }.onFailure {
+            Log.w(logTag, "MDM-WifiLock release failed reason=$reason error=${it.message}")
         }
     }
 
@@ -627,6 +660,7 @@ class MainService : Service() {
         if (activeInstance === this) {
             activeInstance = null
         }
+        releaseRemoteSessionWifiLock("service_destroy")
         releaseScreenWakeLock("service_destroy")
         stopService(Intent(this, FloatingWindowService::class.java))
         super.onDestroy()
@@ -1003,6 +1037,7 @@ class MainService : Service() {
         startAudioForCapture(activeProjection, CAPTURE_SOURCE_MEDIA_PROJECTION)
         checkMediaPermission()
         FFI.setFrameRawEnable("video",true)
+        acquireRemoteSessionWifiLock("media_projection_capture")
         return true
     }
 
@@ -1095,6 +1130,7 @@ class MainService : Service() {
             mediaProjection = null
             _isReady = false
         }
+        releaseRemoteSessionWifiLock("stop_capture")
         releaseScreenWakeLock("stop_capture")
     }
 
@@ -1528,6 +1564,7 @@ class MainService : Service() {
             startMdmKeepaliveThread(mdmDecoder!!)
             startAudioForCapture(activeProjection, CAPTURE_SOURCE_MDM_SCREENRECORD)
             checkMediaPermission()
+            acquireRemoteSessionWifiLock("mdm_screenrecord_capture")
             Log.i(logTag, "mdm screenrecord capture started: ${screenFile.absolutePath}")
             return true
         } catch (e: Throwable) {

@@ -1501,6 +1501,19 @@ fn check_qos(
         bail!("SWITCH");
     }
     if second_instant.elapsed() > Duration::from_secs(1) {
+        #[cfg(target_os = "android")]
+        super::android_log(
+            "rustdesk_video",
+            &format!(
+                "MDM-VideoPipeline service={} target_fps={} encoded_frames={} frame_interval_ms={} ratio={:.3} bitrate_kbps={}",
+                name,
+                video_qos.fps(),
+                *send_counter,
+                spf.as_millis(),
+                *ratio,
+                video_qos.bitrate()
+            ),
+        );
         log::warn!(
             "MDM-VideoPipeline service={} target_fps={} encoded_frames={} frame_interval_ms={} ratio={:.3} bitrate_kbps={}",
             name,

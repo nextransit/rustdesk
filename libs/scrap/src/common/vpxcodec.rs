@@ -26,6 +26,18 @@ pub enum VpxVideoCodecId {
     VP9,
 }
 
+fn dropframe_threshold(is_android: bool) -> u32 {
+    if is_android {
+        // Managed Android capture deliberately reuses the most recent raw frame
+        // when screenrecord is temporarily static. Dropping those frames can
+        // drain the VP9 output completely for more than five seconds even
+        // though the RustDesk relay remains connected.
+        0
+    } else {
+        25
+    }
+}
+
 impl Default for VpxVideoCodecId {
     fn default() -> VpxVideoCodecId {
         VpxVideoCodecId::VP9
@@ -70,11 +82,10 @@ impl EncoderApi for VpxEncoder {
                 c.rc_undershoot_pct = 95;
                 // When the data buffer falls below this percentage of fullness, a dropped frame is indicated. Set the threshold to zero (0) to disable this feature.
                 // In dynamic scenes, low bitrate gets low fps while high bitrate gets high fps.
-                c.rc_dropframe_thresh = 25;
+                c.rc_dropframe_thresh = dropframe_threshold(cfg!(target_os = "android"));
                 let mut encoder_threads = codec_thread_num(64);
                 #[cfg(target_os = "android")]
                 if config.codec == VpxVideoCodecId::VP8 {
-                    c.rc_dropframe_thresh = 0;
                     encoder_threads = encoder_threads.max(2).min(num_cpus::get());
                 }
                 c.g_threads = encoder_threads as _;
@@ -616,3 +627,14 @@ impl Drop for Image {
 }
 
 unsafe impl Send for vpx_codec_ctx_t {}
+
+#[cfg(test)]
+mod tests {
+    use super::dropframe_threshold;
+
+    #[test]
+    fn android_managed_capture_disables_vpx_frame_dropping() {
+        assert_eq!(dropframe_threshold(true), 0);
+        assert_eq!(dropframe_threshold(false), 25);
+    }
+}

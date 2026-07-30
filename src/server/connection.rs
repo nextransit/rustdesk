@@ -1046,7 +1046,25 @@ impl Connection {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
-                    if let Err(err) = conn.stream.send(&value as &Message).await {
+                    #[cfg(target_os = "android")]
+                    let queue_ms = instant.elapsed().as_millis();
+                    #[cfg(target_os = "android")]
+                    let send_started = Instant::now();
+                    let send_result = conn.stream.send(&value as &Message).await;
+                    #[cfg(target_os = "android")]
+                    {
+                        let send_ms = send_started.elapsed().as_millis();
+                        if queue_ms >= 500 || send_ms >= 500 {
+                            android_log(
+                                "rustdesk_transport",
+                                &format!(
+                                    "MDM-VideoSendSlow conn_id={} queue_ms={} send_ms={}",
+                                    id, queue_ms, send_ms
+                                ),
+                            );
+                        }
+                    }
+                    if let Err(err) = send_result {
                         log_transport_send_failure(id, &value, &err);
                         conn.on_close(&err.to_string(), false).await;
                         break;

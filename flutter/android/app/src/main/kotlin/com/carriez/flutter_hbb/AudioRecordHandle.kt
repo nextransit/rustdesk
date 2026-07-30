@@ -58,14 +58,6 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
             Log.w(logTag, "createAudioRecorder failed, unsupported sdk=${Build.VERSION.SDK_INT}")
             return false
         }
-        if (ActivityCompat.checkSelfPermission(
-            context,
-            Manifest.permission.RECORD_AUDIO
-        ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            Log.d(logTag, "createAudioRecorder failed, no RECORD_AUDIO permission")
-            return false
-        }
 
         stopAudioRecorder()
         if (audioThread?.isAlive == true) {
@@ -78,6 +70,19 @@ class AudioRecordHandle(private var context: Context, private var isVideoStart: 
 
         if (!inVoiceCall && mediaProjection == null && configureSystemPlaybackFile()) {
             return true
+        }
+
+        // The managed Android 9 path reads playback PCM captured by the
+        // privileged MDM Agent. It does not open AudioRecord and therefore
+        // must not depend on the companion's microphone permission. Only the
+        // real microphone/playback-capture fallbacks below require it.
+        if (ActivityCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.d(logTag, "createAudioRecorder failed, no RECORD_AUDIO permission")
+            return false
         }
 
         val requests = mutableListOf<AudioRecorderRequest>()
