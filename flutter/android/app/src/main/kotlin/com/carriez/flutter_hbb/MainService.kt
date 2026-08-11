@@ -731,6 +731,19 @@ class MainService : Service() {
                         "MDM-OrientationChange waiting_for_agent_screenrecord_restart " +
                             "capture=${mdmCaptureWidth}x${mdmCaptureHeight} target=${w}x${h}"
                     )
+                    // F-06 (HIGH): 刷新 scrap 端 SCREEN_SIZE 缓存。当屏幕旋转且使用
+                    // mdm screenrecord 时，updateScreenInfo 已更新 SCREEN_INFO（flutter_hbb
+                    // 端），但 scrap 端的 SCREEN_SIZE（Rust lazy_static Mutex）仍为旧值。
+                    // 不调用 FFI.refreshScreen() 会导致：
+                    //   1. scrap Display::width()/height() 返回旧方向值
+                    //   2. video_service CapturerInfo.display_width/height 仍为旧方向
+                    //   3. 控制端（web-console）基于错误的 display_width/height 发送坐标
+                    //   4. RustDeskInputProvider 用 getRealSize() 物理尺寸校验，
+                    //      坐标范围不匹配 → 注入位置错误（横屏导航栏点不中）
+                    // refreshScreen() 触发 Display::refresh_size() + ANDROID_REFRESH_EPOCH
+                    // 递增 → video_service 主循环检测到 epoch 变化 → bail!("SWITCH")
+                    // → 重新创建 Capturer 并广播新 display_width/height 给控制端。
+                    FFI.refreshScreen()
                 } else if (isStart) {
                     markCaptureInactive(
                         reason = "orientation_changed",
