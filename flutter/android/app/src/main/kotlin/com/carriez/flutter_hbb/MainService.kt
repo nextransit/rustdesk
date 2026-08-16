@@ -371,6 +371,7 @@ class MainService : Service() {
         @Volatile private var captureSourceValue = CAPTURE_SOURCE_NONE
         @Volatile private var mdmCaptureWidth = 0
         @Volatile private var mdmCaptureHeight = 0
+        @Volatile private var mdmCaptureDisplayId = android.view.Display.DEFAULT_DISPLAY
         @Volatile private var mediaProjectionRequestStartedAtMs = 0L
         @Volatile private var activeInstance: MainService? = null
         val isReady: Boolean
@@ -417,6 +418,8 @@ class MainService : Service() {
             get() = if (captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD && mdmCaptureWidth > 0) mdmCaptureWidth else SCREEN_INFO.width
         val captureHeight: Int
             get() = if (captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD && mdmCaptureHeight > 0) mdmCaptureHeight else SCREEN_INFO.height
+        val captureDisplayId: Int
+            get() = if (captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD) mdmCaptureDisplayId else android.view.Display.DEFAULT_DISPLAY
         val mediaProjectionRequestInFlight: Boolean
             get() {
                 val startedAt = mediaProjectionRequestStartedAtMs
@@ -1093,6 +1096,7 @@ class MainService : Service() {
         captureSourceValue = CAPTURE_SOURCE_NONE
         mdmCaptureWidth = 0
         mdmCaptureHeight = 0
+        mdmCaptureDisplayId = android.view.Display.DEFAULT_DISPLAY
         MainActivity.rdClipboardManager?.setCaptureStarted(_isStart)
         // release video
         virtualDisplay?.let { display ->
@@ -1416,31 +1420,71 @@ class MainService : Service() {
 
     // ─── P0-fix(mdm-companion-android-9): mdm screenrecord 视频读取路径 ───
     /**
-     * 检测 mdm-agent (uid 1000, system app) 是否在跑 shell `screenrecord` 写
-     * h264 到 /sdcard/Android/data/com.decard.mdm.agent/files/system_screen.h264.
-     * 如果是, flutter_hbb 改用 Annex-B H264 增量解码读这个 h264 文件 (不走 MediaProjection
-     * 流程), 彻底绕开 Android 9 SurfaceFlinger.getUniqueId() bug.
-     *
-     * 检测: 读 mdm 私有外部存储的 meta JSON + 验证文件存在 + 检查 screenrecord 进程.
+     * 检测 mdm-agent (uid 1000, system app) 提供的 managed Annex-B H264 是否就绪.
+     * 主屏由 shell screenrecord 产出, 副屏由 agent 进程内 SurfaceControl + MediaCodec
+     * 产出, 两者共用同一文件和 meta 协议.
      */
-    private fun useMdmSystemScreenrecord(): Boolean {
+    private fun useMdmSystemScreenrecord(expectedDisplayId: Int? = null): Boolean {
         return try {
             val metaFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen_meta.json")
             if (!metaFile.exists()) return false
             val screenFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen.h264")
             val readyDeadline = System.currentTimeMillis() + 3000L
+            var lastState = "missing"
+            var lastDisplayId = android.view.Display.DEFAULT_DISPLAY
+            var processRunning = false
             while (System.currentTimeMillis() < readyDeadline) {
-                val proc = Runtime.getRuntime().exec(arrayOf("pidof", "screenrecord"))
-                val running = proc.waitFor() == 0
-                if (!running) return false
-                if (screenFile.exists() && screenFile.length() >= 1024L) {
+                val meta = runCatching { JSONObject(metaFile.readText()) }.getOrNull()
+                if (meta == null) {
+                    Thread.sleep(100L)
+                    continue
+                }
+                lastState = meta.optString("state", "unknown")
+                lastDisplayId = meta.optInt(
+                    "displayId",
+                    android.view.Display.DEFAULT_DISPLAY
+                )
+                processRunning = lastDisplayId != android.view.Display.DEFAULT_DISPLAY ||
+                    isMdmScreenrecordProcessRunning()
+                val displayMatches = expectedDisplayId == null ||
+                    lastDisplayId == expectedDisplayId
+                if (lastState == "active" &&
+                    displayMatches &&
+                    processRunning &&
+                    screenFile.exists() &&
+                    screenFile.length() >= 1024L &&
+                    hasCompleteMdmAvcBootstrap(screenFile)
+                ) {
                     return true
                 }
-                Thread.sleep(100)
+                Thread.sleep(100L)
             }
-            Log.w(logTag, "mdm screenrecord file not ready after wait: exists=${screenFile.exists()} size=${screenFile.length()}")
+            Log.w(
+                logTag,
+                "mdm managed capture not ready after wait: state=$lastState " +
+                    "displayId=$lastDisplayId expectedDisplayId=$expectedDisplayId " +
+                    "producerRunning=$processRunning exists=${screenFile.exists()} " +
+                    "size=${screenFile.length()}"
+            )
             false
         } catch (e: Throwable) {
+            Log.w(logTag, "mdm managed capture readiness check failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun hasCompleteMdmAvcBootstrap(screenFile: java.io.File): Boolean {
+        return try {
+            java.io.RandomAccessFile(screenFile, "r").use { stream ->
+                val bootstrap = readMdmFeedBootstrap(
+                    stream,
+                    stream.length(),
+                    allowStableTrailingNal = true
+                )
+                val nalTypes = bootstrap.nalUnits.map(::mdmH264NalType)
+                7 in nalTypes && 8 in nalTypes && 5 in nalTypes
+            }
+        } catch (_: Throwable) {
             false
         }
     }
@@ -1458,15 +1502,21 @@ class MainService : Service() {
     @Synchronized
     private fun switchToMdmSystemScreenrecordCapture(reason: String, forceRestart: Boolean): Boolean {
         val targetMeta = readMdmScreenrecordMeta()
+        val targetDisplayId = readMdmScreenrecordDisplayId()
         if (captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD && isStart && !forceRestart) {
             val currentWidth = mdmCaptureWidth.takeIf { it > 0 } ?: SCREEN_INFO.width
             val currentHeight = mdmCaptureHeight.takeIf { it > 0 } ?: SCREEN_INFO.height
-            if (currentWidth == targetMeta.first && currentHeight == targetMeta.second) {
+            if (currentWidth == targetMeta.first &&
+                currentHeight == targetMeta.second &&
+                mdmCaptureDisplayId == targetDisplayId
+            ) {
                 return true
             }
             Log.i(
                 logTag,
-                "switch to mdm screenrecord requires restart reason=$reason current=${currentWidth}x$currentHeight target=${targetMeta.first}x${targetMeta.second}"
+                "switch to mdm screenrecord requires restart reason=$reason " +
+                    "current=${currentWidth}x$currentHeight displayId=$mdmCaptureDisplayId " +
+                    "target=${targetMeta.first}x${targetMeta.second} displayId=$targetDisplayId"
             )
         } else if (captureSourceValue == CAPTURE_SOURCE_MDM_SCREENRECORD && isStart) {
             Log.i(logTag, "force restart mdm screenrecord capture reason=$reason")
@@ -1478,7 +1528,7 @@ class MainService : Service() {
                 releaseVirtualDisplay = true
             )
         }
-        if (!useMdmSystemScreenrecord()) {
+        if (!useMdmSystemScreenrecord(targetDisplayId)) {
             Log.w(logTag, "switch to mdm screenrecord skipped: source not ready reason=$reason")
             return false
         }
@@ -1513,6 +1563,7 @@ class MainService : Service() {
             val screenMeta = readMdmScreenrecordMeta()
             val frameWidth = screenMeta.first
             val frameHeight = screenMeta.second
+            val frameDisplayId = readMdmScreenrecordDisplayId()
             val activeFeed = mdmScreenrecordThread
             if (
                 _isStart &&
@@ -1520,9 +1571,10 @@ class MainService : Service() {
                 mdmDecoder != null &&
                 activeFeed?.isAlive == true &&
                 mdmCaptureWidth == frameWidth &&
-                mdmCaptureHeight == frameHeight
+                mdmCaptureHeight == frameHeight &&
+                mdmCaptureDisplayId == frameDisplayId
             ) {
-                Log.i(logTag, "mdm screenrecord capture already active: ${frameWidth}x${frameHeight}")
+                Log.i(logTag, "mdm screenrecord capture already active: ${frameWidth}x${frameHeight} displayId=$frameDisplayId")
                 return true
             }
             if (mdmDecoder != null || activeFeed != null || mdmKeepaliveThread != null) {
@@ -1555,6 +1607,7 @@ class MainService : Service() {
             captureSourceValue = CAPTURE_SOURCE_MDM_SCREENRECORD
             mdmCaptureWidth = frameWidth
             mdmCaptureHeight = frameHeight
+            mdmCaptureDisplayId = frameDisplayId
             FFI.refreshScreen()
             serviceHandler?.postDelayed({
                 if (
@@ -1589,6 +1642,7 @@ class MainService : Service() {
             captureSourceValue = CAPTURE_SOURCE_NONE
             mdmCaptureWidth = 0
             mdmCaptureHeight = 0
+            mdmCaptureDisplayId = android.view.Display.DEFAULT_DISPLAY
             return false
         }
     }
@@ -1707,6 +1761,16 @@ class MainService : Service() {
     private fun readMdmScreenrecordMeta(): Pair<Int, Int> {
         return readMdmScreenrecordMetaFromFile(logFailure = true)
             ?: Pair(SCREEN_INFO.width, SCREEN_INFO.height)
+    }
+
+    private fun readMdmScreenrecordDisplayId(): Int {
+        return try {
+            val metaFile = java.io.File("/sdcard/Android/data/com.decard.mdm.agent/files/system_screen_meta.json")
+            if (!metaFile.exists()) android.view.Display.DEFAULT_DISPLAY
+            else JSONObject(metaFile.readText()).optInt("displayId", android.view.Display.DEFAULT_DISPLAY)
+        } catch (_: Throwable) {
+            android.view.Display.DEFAULT_DISPLAY
+        }
     }
 
     private fun readMdmScreenrecordGeneration(): Long {
