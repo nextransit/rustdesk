@@ -84,10 +84,20 @@ class MainService : Service() {
                 "MDM-InputDispatch pointer_route=provider_fallback kind=$kind mask=$mask " +
                     "raw_x=$x raw_y=$y x=$mappedX y=$mappedY"
             )
-            if (MdmInputFallback.pointer(applicationContext, kind, mask, mappedX, mappedY)) {
-                return
+            when (MdmInputFallback.pointer(applicationContext, kind, mask, mappedX, mappedY)) {
+                MdmInputFallback.PointerResult.SUCCESS -> return
+                MdmInputFallback.PointerResult.REJECTED_OUT_OF_BOUNDS -> {
+                    Log.w(
+                        logTag,
+                        "MDM-InputDispatch pointer_rejected_out_of_bounds kind=$kind mask=$mask " +
+                            "x=$mappedX y=$mappedY"
+                    )
+                    return
+                }
+                MdmInputFallback.PointerResult.FAILED -> {
+                    Log.w(logTag, "MDM-InputDispatch provider_fallback_failed kind=$kind mask=$mask")
+                }
             }
-            Log.w(logTag, "MDM-InputDispatch provider_fallback_failed kind=$kind mask=$mask")
         }
         val inputService = InputService.ctx
         if (inputService != null) {
@@ -1564,6 +1574,14 @@ class MainService : Service() {
             val frameWidth = screenMeta.first
             val frameHeight = screenMeta.second
             val frameDisplayId = readMdmScreenrecordDisplayId()
+            val oldCaptureWidth = mdmCaptureWidth
+            val oldCaptureHeight = mdmCaptureHeight
+            val oldCaptureDisplayId = mdmCaptureDisplayId
+            val dimensionsChanged = oldCaptureWidth <= 0 ||
+                oldCaptureHeight <= 0 ||
+                oldCaptureWidth != frameWidth ||
+                oldCaptureHeight != frameHeight
+            val displayChanged = oldCaptureDisplayId != frameDisplayId
             val activeFeed = mdmScreenrecordThread
             if (
                 _isStart &&
@@ -1580,6 +1598,10 @@ class MainService : Service() {
             if (mdmDecoder != null || activeFeed != null || mdmKeepaliveThread != null) {
                 Log.w(logTag, "mdm screenrecord stale capture resources detected; releasing before restart")
                 stopMdmScreenrecordCapture()
+            }
+            if (dimensionsChanged || displayChanged) {
+                mdmLastRgbaFrame = null
+                FFI.setFrameRawEnable("video", false)
             }
             val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, frameWidth, frameHeight)
             videoFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024)

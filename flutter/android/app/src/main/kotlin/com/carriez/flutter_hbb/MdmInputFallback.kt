@@ -16,12 +16,19 @@ object MdmInputFallback {
     private const val METHOD_KEY = "key"
     private const val METHOD_STATUS = "status"
     private const val KEY_SUCCESS = "success"
+    private const val KEY_REJECTED_OUT_OF_BOUNDS = "rejected_out_of_bounds"
+
+    enum class PointerResult {
+        SUCCESS,
+        FAILED,
+        REJECTED_OUT_OF_BOUNDS,
+    }
 
     fun isAvailable(context: Context): Boolean {
         return callProvider(context, METHOD_STATUS, Bundle())?.getBoolean(KEY_SUCCESS, false) == true
     }
 
-    fun pointer(context: Context, kind: Int, mask: Int, x: Int, y: Int): Boolean {
+    fun pointer(context: Context, kind: Int, mask: Int, x: Int, y: Int): PointerResult {
         val result = callProvider(
             context,
             METHOD_POINTER,
@@ -36,7 +43,14 @@ object MdmInputFallback {
                 putInt("y", y)
             }
         )
-        return result?.getBoolean(KEY_SUCCESS, false) == true
+        if (result?.getBoolean(KEY_REJECTED_OUT_OF_BOUNDS, false) == true) {
+            return PointerResult.REJECTED_OUT_OF_BOUNDS
+        }
+        return if (result?.getBoolean(KEY_SUCCESS, false) == true) {
+            PointerResult.SUCCESS
+        } else {
+            PointerResult.FAILED
+        }
     }
 
     fun key(context: Context, input: ByteArray): Boolean {
